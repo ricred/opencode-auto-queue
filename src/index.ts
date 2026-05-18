@@ -526,7 +526,7 @@ export const AutoQueuePlugin = {
 
     const queueTool = tool({
       description:
-        "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get. Only switch modes when explicitly requested.",
+        "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get. Both modes queue messages while session is busy; hold = queued messages held until manual drain, immediate = queued messages auto-drain on idle. Only switch modes when explicitly requested.",
       args: {
         action: tool.schema
           .enum(["hold", "immediate", "status", "clear", "drop", "peek", "retry", "pause", "resume", "count", "config", "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get"])
@@ -607,20 +607,20 @@ export const AutoQueuePlugin = {
           return `Next: ${next.preview}${retry} [waiting ${age}s]`;
         }
 
-        if (nextAction === "hold") {
-          if (currentMode === "hold") return `Mode: hold`;
-          currentMode = "hold";
-          schedulePersist();
-          return `Mode: hold (messages queued when busy)`;
-        }
+    if (nextAction === "hold") {
+      if (currentMode === "hold") return `Mode: hold`;
+      currentMode = "hold";
+      schedulePersist();
+      return `Mode: hold (queued messages held until manually drained)`;
+    }
 
-        if (nextAction === "immediate") {
-          if (currentMode === "immediate") return `Mode: immediate`;
-          currentMode = "immediate";
-          schedulePersist();
-          await drain(ctx.sessionID);
-          return `Mode: immediate (messages sent right away)`;
-        }
+    if (nextAction === "immediate") {
+      if (currentMode === "immediate") return `Mode: immediate`;
+      currentMode = "immediate";
+      schedulePersist();
+      await drain(ctx.sessionID);
+      return `Mode: immediate (queued messages drain automatically on idle)`;
+    }
 
         if (nextAction === "clear") {
           const cleared = queue.length;
@@ -790,19 +790,19 @@ export const AutoQueuePlugin = {
       const failedCount = queue.filter((i) => i.status === "failed").length;
 
       switch (normalized) {
-        case "hold": {
-          if (currentMode === "hold") return `Queue mode: hold (already active)`;
-          currentMode = "hold";
-          schedulePersist();
-          return `Queue mode: hold (messages queued when busy)`;
-        }
-        case "immediate": {
-          if (currentMode === "immediate") return `Queue mode: immediate (already active)`;
-          currentMode = "immediate";
-          schedulePersist();
-          drain(sessionID).catch(() => {});
-          return `Queue mode: immediate (messages sent right away)`;
-        }
+    case "hold": {
+      if (currentMode === "hold") return `Queue mode: hold (already active)`;
+      currentMode = "hold";
+      schedulePersist();
+      return `Queue mode: hold (queued messages held until manually drained)`;
+    }
+    case "immediate": {
+      if (currentMode === "immediate") return `Queue mode: immediate (already active)`;
+      currentMode = "immediate";
+      schedulePersist();
+      drain(sessionID).catch(() => {});
+      return `Queue mode: immediate (queued messages drain automatically on idle)`;
+    }
         case "status": {
           const lines = [
             `Mode: ${currentMode}`,
@@ -943,8 +943,8 @@ export const AutoQueuePlugin = {
     }
 
     const queueCommands: Record<string, { template: string; description: string }> = {
-      "queue-hold": { template: "$ARGUMENTS", description: "Switch queue to hold mode (auto-drain on idle)" },
-      "queue-immediate": { template: "$ARGUMENTS", description: "Switch queue to immediate mode" },
+  "queue-hold": { template: "$ARGUMENTS", description: "Hold queued messages until manually drained" },
+  "queue-immediate": { template: "$ARGUMENTS", description: "Auto-drain queued messages on idle" },
       "queue-status": { template: "$ARGUMENTS", description: "Show queue status" },
       "queue-clear": { template: "$ARGUMENTS", description: "Clear the queue" },
       "queue-pause": { template: "$ARGUMENTS", description: "Pause auto-drain" },
@@ -975,117 +975,113 @@ export const AutoQueuePlugin = {
         output.parts = markInternalParts([{ type: "text", text: result }]);
       },
 
-      event: async ({ event }: { event: any }) => {
-        if (event.type === "session.status") {
-          const { sessionID, status } = event.properties;
-          const busy = status.type !== "idle";
-          busyBySession.set(sessionID, busy);
-          if (!busy && currentMode === "hold" && !pausedBySession.has(sessionID)) {
-            await drain(sessionID);
-          }
-          return;
-        }
+  event: async ({ event }: { event: any }) => {
+    if (event.type === "session.status") {
+      const { sessionID, status } = event.properties;
+      const busy = status.type !== "idle";
+      busyBySession.set(sessionID, busy);
+      if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
+        await drain(sessionID);
+      }
+      return;
+    }
 
-        if (event.type === "session.idle") {
-          const { sessionID } = event.properties;
-          busyBySession.set(sessionID, false);
-          if (currentMode === "hold" && !pausedBySession.has(sessionID)) {
-            await drain(sessionID);
-          }
-        }
-      },
+    if (event.type === "session.idle") {
+      const { sessionID } = event.properties;
+      busyBySession.set(sessionID, false);
+      if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
+        await drain(sessionID);
+      }
+    }
+  },
 
-      "chat.message": async (input: any, output: any) => {
-        if (currentMode !== "hold") return;
-        if (isInternalMessage(output.parts)) return;
+  "chat.message": async (input: any, output: any) => {
+    if (isInternalMessage(output.parts)) return;
 
-        const parts = output.parts ?? [];
-        const firstText = parts.find((p: any) => p.type === "text" && typeof p.text === "string" && p.text.length > 0);
-        if (firstText) {
-          const trimmed = firstText.text.trim();
-          if (trimmed.startsWith("/queue-") || trimmed.startsWith("/queue ")) {
-            const cmdName = trimmed.replace(/^\//, "").split(/\s+/)[0];
-            const cmdArgs = trimmed.replace(/^\//, "").slice(cmdName.length).trim();
-            const result = handleSlashCommand(cmdName, cmdArgs, input.sessionID);
-            if (result !== null) {
-              output.parts.length = 0;
-              output.parts.push(...markInternalParts([{ type: "text", text: result }]));
-              return;
-            }
-          }
-        }
-
-        if (draining.has(input.sessionID)) return;
-
-        const textParts = parts.filter((p: any) => p.type === "text");
-        const allSystemReminders = textParts.every((p: any) =>
-          typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
-        );
-        if (allSystemReminders) return;
-
-        const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
-        if (allSynthetic) return;
-
-        const busy = isBusy(input.sessionID);
-        const pendingCount = getPendingCount(queueBySession.get(input.sessionID) ?? []);
-        const shouldQueue = busy || pendingCount > 0;
-
-        if (!shouldQueue) {
-          markBusy(input.sessionID);
-          return;
-        }
-
-        const queue = getQueue(input.sessionID);
-        if (queue.length >= maxQueueSize) {
-          try {
-            await client.tui.showToast({
-              body: {
-                title: "Message Queue",
-                message: `Queue full (${maxQueueSize} max). Message dropped.`,
-                variant: "error",
-                duration: emptyToastDurationMs * 3,
-              },
-            });
-          } catch { /* noop */ }
-          const placeholder = makePlaceholder(output.parts, queue.length, `Queue full; dropped.`);
-          if (placeholder) {
-            output.parts.length = 0;
-            output.parts.push(placeholder);
-          }
-          return;
-        }
-
-        const originalParts = [...output.parts];
-        const queuedParts = originalParts.map(toPromptPart).filter((p: any) => p !== null);
-        const preview = extractPreview(queuedParts);
-
-        queue.push({
-          sessionID: input.sessionID,
-          agent: input.agent ?? output.message.agent,
-          model: input.model ?? output.message.model,
-          system: output.message.system,
-          tools: output.message.tools,
-          messageID: input.messageID,
-          variant: input.variant,
-          parts: queuedParts,
-          preview,
-          status: "queued",
-          retries: 0,
-          enqueuedAt: Date.now(),
-        });
-
-        const queueSize = getPendingCount(queue);
-        const placeholder = makePlaceholder(originalParts, queueSize, placeholderTemplate);
-        if (placeholder) {
+    const parts = output.parts ?? [];
+    const firstText = parts.find((p: any) => p.type === "text" && typeof p.text === "string" && p.text.length > 0);
+    if (firstText) {
+      const trimmed = firstText.text.trim();
+      if (trimmed.startsWith("/queue-") || trimmed.startsWith("/queue ")) {
+        const cmdName = trimmed.replace(/^\//, "").split(/\s+/)[0];
+        const cmdArgs = trimmed.replace(/^\//, "").slice(cmdName.length).trim();
+        const result = handleSlashCommand(cmdName, cmdArgs, input.sessionID);
+        if (result !== null) {
           output.parts.length = 0;
-          output.parts.push(placeholder);
+          output.parts.push(...markInternalParts([{ type: "text", text: result }]));
+          return;
         }
+      }
+    }
 
-        schedulePersist();
-        try {
-          await showToast(input.sessionID);
-        } catch { /* TUI may not be active */ }
-      },
+    if (draining.has(input.sessionID)) return;
+
+    const textParts = parts.filter((p: any) => p.type === "text");
+    const allSystemReminders = textParts.every((p: any) =>
+      typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
+    );
+    if (allSystemReminders) return;
+
+    const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
+    if (allSynthetic) return;
+
+    const busy = isBusy(input.sessionID);
+    if (!busy) {
+      markBusy(input.sessionID);
+      return;
+    }
+
+    const queue = getQueue(input.sessionID);
+    if (queue.length >= maxQueueSize) {
+      try {
+        await client.tui.showToast({
+          body: {
+            title: "Message Queue",
+            message: `Queue full (${maxQueueSize} max). Message dropped.`,
+            variant: "error",
+            duration: emptyToastDurationMs * 3,
+          },
+        });
+      } catch { /* noop */ }
+      const placeholder = makePlaceholder(output.parts, queue.length, `Queue full; dropped.`);
+      if (placeholder) {
+        output.parts.length = 0;
+        output.parts.push(placeholder);
+      }
+      return;
+    }
+
+    const originalParts = [...output.parts];
+    const queuedParts = originalParts.map(toPromptPart).filter((p: any) => p !== null);
+    const preview = extractPreview(queuedParts);
+
+    queue.push({
+      sessionID: input.sessionID,
+      agent: input.agent ?? output.message.agent,
+      model: input.model ?? output.message.model,
+      system: output.message.system,
+      tools: output.message.tools,
+      messageID: input.messageID,
+      variant: input.variant,
+      parts: queuedParts,
+      preview,
+      status: "queued",
+      retries: 0,
+      enqueuedAt: Date.now(),
+    });
+
+    const queueSize = getPendingCount(queue);
+    const placeholder = makePlaceholder(originalParts, queueSize, placeholderTemplate);
+    if (placeholder) {
+      output.parts.length = 0;
+      output.parts.push(placeholder);
+    }
+
+    schedulePersist();
+    try {
+      await showToast(input.sessionID);
+    } catch { /* TUI may not be active */ }
+  },
     };
   },
 };
