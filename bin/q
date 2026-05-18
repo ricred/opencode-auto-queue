@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""opencode queue CLI — manage .git/queue.json per project.
+
+Usage:
+  q status              Show queue status (default if no action)
+  q hold                Set mode to hold
+  q immediate           Set mode to immediate
+  q clear               Clear all items
+  q drop [INDEX]        Drop item at INDEX (default 1)
+  q peek                Show next item
+  q retry               Reset all failed items to queued
+  q pause               Pause auto-drain
+  q resume              Resume auto-drain
+  q count               Show pending count
+  q config              Show configuration
+  q reorder FROM TO     Move item FROM position to TO
+  q insert INDEX TEXT   Insert text at INDEX
+  q append TEXT         Append text to end of queue
+  q prepend TEXT        Prepend text to front of queue
+  q delete [INDEX]      Delete item at INDEX (default 1)
+  q set INDEX TEXT      Replace item at INDEX with new text
+  q sort                Sort by enqueue time (oldest first)
+  q invert              Reverse queue order
+  q get [INDEX]         Show full details of item at INDEX
+"""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+QUEUE_FILE = Path(".git") / "queue.json"
+VERSION = 1
+
+
+def find_queue_file() -> Path:
+    """Walk up to find .git/queue.json."""
+    cwd = Path.cwd()
+    while cwd != cwd.parent:
+        candidate = cwd / ".git" / "queue.json"
+        if candidate.exists():
+            return candidate
+        cwd = cwd.parent
+    return Path.cwd() / ".git" / "queue.json"
+
+
+def load_state(path: Path) -> dict:
+    if not path.exists():
+        return {"version": VERSION, "mode": "hold", "queues": {}, "pausedSessions": []}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if not data or data.get("version") != 1:
+            return {"version": VERSION, "mode": "hold", "queues": {}, "pausedSessions": []}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"version": VERSION, "mode": "hold", "queues": {}, "pausedSessions": []}
+
+
+def save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+        f.write("\n")
+
+
+def get_queue(state: dict) -> list:
+    queues = state.get("queues", {})
+    if not queues:
+        return []
+    first_key = next(iter(queues), None)
+    if first_key:
+        return queues[first_key]
+    return []
+
+
+def set_queue(state: dict, queue: list) -> dict:
+    queues = state.get("queues", {})
+    if queues:
+        first_key = next(iter(queues))
+        queues[first_key] = queue
+    else:
+        queues["default"] = queue
+    state["queues"] = queues
+    return state
+
+
+def pending_count(queue: list) -> int:
+    return sum(1 for i in queue if i.get("status") in ("queued", "sending", "failed"))
+
+
+def failed_count(queue: list) -> int:
+    return sum(1 for i in queue if i.get("status") == "failed")
+
+
+def make_item(text: str) -> dict:
+    return {
+        "sessionID": "",
+        "parts": [{"type": "text", "text": text}],
+        "preview": text[:28] + ("..." if len(text) > 28 else ""),
+        "status": "queued",
+        "retries": 0,
+        "enqueuedAt": int(time.time() * 1000),
+    }
+
+
+def cmd_status(state: dict, path: Path) -> str:
+    mode = state.get("mode", "hold")
+    paused = state.get("pausedSessions", [])
+    queue = get_queue(state)
+    pc = pending_count(queue)
+    fc = failed_count(queue)
+    lines = [
+        f"Mode: {mode}",
+        f"Paused: {bool(paused)}",
+        f"Queued: {pc}",
+        f"Failed: {fc}",
+        f"File: {path}",
+    ]
+    if queue:
+        lines.append("")
+        lines.append("Queue:")
+        for i, item in enumerate(queue):
+            s = item.get("status", "queued")
+            icon = {"sent": "[x]", "sending": "[>]", "failed": "[!]"}.get(s, "[ ]")
+            preview = item.get("preview", "?")
+            retries = item.get("retries", 0)
+            retry_str = f" ({retries} retries)" if retries > 0 else ""
+            age_s = int((time.time() * 1000 - item.get("enqueuedAt", 0)) / 1000)
+            lines.append(f"  {i + 1}. {icon} {preview}{retry_str} [{age_s}s ago]")
+    return "\n".join(lines)
+
+
+def cmd_hold(state: dict) -> str:
+    if state.get("mode") == "hold":
+        return "Mode: hold (already active)"
+    state["mode"] = "hold"
+    return "Mode: hold (messages queued when busy)"
+
+
+def cmd_immediate(state: dict) -> str:
+    if state.get("mode") == "immediate":
+        return "Mode: immediate (already active)"
+    state["mode"] = "immediate"
+    return "Mode: immediate (messages sent right away)"
+
+
+def cmd_clear(state: dict) -> str:
+    queue = get_queue(state)
+    cleared = len(queue)
+    state = set_queue(state, [])
+    return f"Cleared {cleared} messages from queue"
+
+
+def cmd_drop(state: dict, index: int) -> str:
+    queue = get_queue(state)
+    idx = index - 1
+    if idx < 0 or idx >= len(queue):
+        return f"Invalid index. Queue has {len(queue)} items."
+    dropped = queue.pop(idx)
+    state = set_queue(state, queue)
+    return f"Dropped: {dropped.get('preview', '?')}"
+
+
+def cmd_peek(state: dict) -> str:
+    queue = get_queue(state)
+    for item in queue:
+        if item.get("status") in ("queued", "failed"):
+            preview = item.get("preview", "?")
+            retries = item.get("retries", 0)
+            retry_str = f" (retried {retries}x)" if retries > 0 else ""
+            age_s = int((time.time() * 1000 - item.get("enqueuedAt", 0)) / 1000)
+            return f"Next: {preview}{retry_str} [waiting {age_s}s]"
+    return "Queue is empty"
+
+
+def cmd_retry(state: dict) -> str:
+    queue = get_queue(state)
+    failed = [i for i in queue if i.get("status") == "failed"]
+    if not failed:
+        return "No failed items to retry."
+    for item in failed:
+        item["status"] = "queued"
+        item["retries"] = 0
+        item.pop("lastError", None)
+    state = set_queue(state, queue)
+    return f"Retrying {len(failed)} failed messages"
+
+
+def cmd_pause(state: dict) -> str:
+    paused = state.get("pausedSessions", [])
+    if "default" not in paused:
+        paused.append("default")
+    state["pausedSessions"] = paused
+    return "Queue paused."
+
+
+def cmd_resume(state: dict) -> str:
+    paused = state.get("pausedSessions", [])
+    state["pausedSessions"] = [s for s in paused if s != "default"]
+    return "Queue resumed."
+
+
+def cmd_count(state: dict) -> str:
+    queue = get_queue(state)
+    pc = pending_count(queue)
+    fc = failed_count(queue)
+    return f"{pc} messages in queue ({fc} failed)"
+
+
+def cmd_config(state: dict, path: Path) -> str:
+    return "\n".join([
+        "Queue Configuration:",
+        f"  mode: {state.get('mode', 'hold')}",
+        f"  persistPath: {path}",
+        f"  pausedSessions: {state.get('pausedSessions', [])}",
+        f"  sessions: {list(state.get('queues', {}).keys())}",
+    ])
+
+
+def cmd_reorder(state: dict, frm: int, to: int) -> str:
+    queue = get_queue(state)
+    if frm < 1 or frm > len(queue) or to < 1 or to > len(queue):
+        return f"Index out of range. Queue has {len(queue)} items."
+    item = queue.pop(frm - 1)
+    queue.insert(to - 1, item)
+    state = set_queue(state, queue)
+    return f"Moved item {frm} to position {to}"
+
+
+def cmd_insert(state: dict, index: int, text: str) -> str:
+    queue = get_queue(state)
+    if index < 1 or index > len(queue) + 1:
+        return f"Index out of range. Queue has {len(queue)} items."
+    item = make_item(text)
+    queue.insert(index - 1, item)
+    state = set_queue(state, queue)
+    return f"Inserted at position {index}: {item['preview']}"
+
+
+def cmd_append(state: dict, text: str) -> str:
+    queue = get_queue(state)
+    item = make_item(text)
+    queue.append(item)
+    state = set_queue(state, queue)
+    return f"Appended: {item['preview']}"
+
+
+def cmd_prepend(state: dict, text: str) -> str:
+    queue = get_queue(state)
+    item = make_item(text)
+    queue.insert(0, item)
+    state = set_queue(state, queue)
+    return f"Prepended: {item['preview']}"
+
+
+def cmd_delete(state: dict, index: int) -> str:
+    queue = get_queue(state)
+    idx = index - 1
+    if idx < 0 or idx >= len(queue):
+        return f"Index out of range. Queue has {len(queue)} items."
+    dropped = queue.pop(idx)
+    state = set_queue(state, queue)
+    return f"Deleted: {dropped.get('preview', '?')}"
+
+
+def cmd_set(state: dict, index: int, text: str) -> str:
+    queue = get_queue(state)
+    if index < 1 or index > len(queue):
+        return f"Index out of range. Queue has {len(queue)} items."
+    item = make_item(text)
+    queue[index - 1] = item
+    state = set_queue(state, queue)
+    return f"Set position {index}: {item['preview']}"
+
+
+def cmd_sort(state: dict) -> str:
+    queue = get_queue(state)
+    queue.sort(key=lambda i: i.get("enqueuedAt", 0))
+    state = set_queue(state, queue)
+    return f"Sorted {len(queue)} items by time (oldest first)"
+
+
+def cmd_invert(state: dict) -> str:
+    queue = get_queue(state)
+    queue.reverse()
+    state = set_queue(state, queue)
+    return f"Reversed {len(queue)} items"
+
+
+def cmd_get(state: dict, index: int) -> str:
+    queue = get_queue(state)
+    if index < 1 or index > len(queue):
+        return f"Index out of range. Queue has {len(queue)} items."
+    item = queue[index - 1]
+    age_s = int((time.time() * 1000 - item.get("enqueuedAt", 0)) / 1000)
+    retries = item.get("retries", 0)
+    last_err = item.get("lastError", "")
+    retry_str = f"\nRetries: {retries}" if retries > 0 else ""
+    err_str = f"\nError: {last_err}" if last_err else ""
+    text_parts = [p.get("text", "") for p in item.get("parts", []) if p.get("type") == "text"]
+    content = "\n".join(text_parts) if text_parts else "(no text content)"
+    return "\n".join([
+        f"Item {index}/{len(queue)} status: {item.get('status', '?')} age: {age_s}s{retry_str}{err_str}",
+        f"Preview: {item.get('preview', '?')}",
+        "Content:",
+        content,
+    ])
+
+
+def parse_index(arg: str) -> int | None:
+    try:
+        n = int(arg)
+        return n if n > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def main():
+    args = sys.argv[1:]
+    path = find_queue_file()
+    state = load_state(path)
+    needs_save = False
+
+    action = args[0] if args else "status"
+
+    result = ""
+    match action:
+        case "status":
+            result = cmd_status(state, path)
+        case "hold":
+            result = cmd_hold(state)
+            needs_save = True
+        case "immediate":
+            result = cmd_immediate(state)
+            needs_save = True
+        case "clear":
+            result = cmd_clear(state)
+            needs_save = True
+        case "drop":
+            idx = parse_index(args[1]) if len(args) > 1 else 1
+            if idx is None:
+                result = "Invalid index."
+            else:
+                result = cmd_drop(state, idx)
+                needs_save = True
+        case "peek":
+            result = cmd_peek(state)
+        case "retry":
+            result = cmd_retry(state)
+            needs_save = True
+        case "pause":
+            result = cmd_pause(state)
+            needs_save = True
+        case "resume":
+            result = cmd_resume(state)
+            needs_save = True
+        case "count":
+            result = cmd_count(state)
+        case "config":
+            result = cmd_config(state, path)
+        case "reorder":
+            if len(args) < 3:
+                result = "Usage: q reorder <from> <to>"
+            else:
+                frm = parse_index(args[1])
+                to = parse_index(args[2])
+                if frm is None or to is None:
+                    result = "Invalid indices."
+                else:
+                    result = cmd_reorder(state, frm, to)
+                    needs_save = True
+        case "insert":
+            if len(args) < 3:
+                result = "Usage: q insert <index> <text>"
+            else:
+                idx = parse_index(args[1])
+                text = " ".join(args[2:])
+                if idx is None:
+                    result = "Invalid index."
+                else:
+                    result = cmd_insert(state, idx, text)
+                    needs_save = True
+        case "append":
+            if len(args) < 2:
+                result = "Usage: q append <text>"
+            else:
+                text = " ".join(args[1:])
+                result = cmd_append(state, text)
+                needs_save = True
+        case "prepend":
+            if len(args) < 2:
+                result = "Usage: q prepend <text>"
+            else:
+                text = " ".join(args[1:])
+                result = cmd_prepend(state, text)
+                needs_save = True
+        case "delete":
+            idx = parse_index(args[1]) if len(args) > 1 else 1
+            if idx is None:
+                result = "Invalid index."
+            else:
+                result = cmd_delete(state, idx)
+                needs_save = True
+        case "set":
+            if len(args) < 3:
+                result = "Usage: q set <index> <text>"
+            else:
+                idx = parse_index(args[1])
+                text = " ".join(args[2:])
+                if idx is None:
+                    result = "Invalid index."
+                else:
+                    result = cmd_set(state, idx, text)
+                    needs_save = True
+        case "sort":
+            result = cmd_sort(state)
+            needs_save = True
+        case "invert":
+            result = cmd_invert(state)
+            needs_save = True
+        case "get":
+            idx = parse_index(args[1]) if len(args) > 1 else 1
+            if idx is None:
+                result = "Invalid index."
+            else:
+                result = cmd_get(state, idx)
+        case _:
+            result = f"Unknown action: {action}\nTry: status hold immediate clear drop peek retry pause resume count config reorder insert append prepend delete set sort invert get"
+            needs_save = False
+
+    if needs_save:
+        save_state(path, state)
+
+    print(result)
+
+
+if __name__ == "__main__":
+    main()
