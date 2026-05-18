@@ -440,63 +440,68 @@ export const AutoQueuePlugin = {
                   parts: markInternalParts(next.parts),
                 },
               });
-              next.status = "sent";
-              next.lastError = undefined;
-              sent = true;
-            } catch (error: any) {
-              const errMsg = error instanceof Error ? error.message : String(error);
-              if (isTransientError(error) && attempts < maxAttempts) {
-                next.retries = attempts;
-                next.lastError = errMsg;
-                next.status = "failed";
-                const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
-                try {
-                  await client.tui.showToast({
-                    body: {
-                      title: "Message Queue",
-                      message: `Retrying "${truncatePreview(next.preview)}" in ${Math.round(delay / 1000)}s (attempt ${attempts}/${maxRetries})\nError: ${errMsg.slice(0, 80)}`,
-                      variant: "warning",
-                      duration: delay + 2000,
-                    },
-                  });
-                } catch { /* TUI may not be active */ }
-                await sleep(delay);
-                next.status = "queued";
-              } else {
-                next.retries = attempts;
-                next.lastError = errMsg;
-                next.status = "failed";
-                try {
-                  await client.tui.showToast({
-                    body: {
-                      title: "Message Queue",
-                      message: `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`,
-                      variant: "error",
-                      duration: toastDurationMs,
-                    },
-                  });
-                } catch { /* TUI may not be active */ }
-                break;
-              }
-            }
-          }
-
-          schedulePersist();
+        next.status = "sent";
+        next.lastError = undefined;
+        sent = true;
+      } catch (error: any) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        if (isTransientError(error) && attempts < maxAttempts) {
+          next.retries = attempts;
+          next.lastError = errMsg;
+          next.status = "failed";
+          const delay = BackoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
           try {
-            await showToast(sessionID);
+            await client.tui.showToast({
+              body: {
+                title: "Message Queue",
+                message: `Retrying "${truncatePreview(next.preview)}" in ${Math.round(delay / 1000)}s (attempt ${attempts}/${maxRetries})\nError: ${errMsg.slice(0, 80)}`,
+                variant: "warning",
+                duration: delay + 2000,
+              },
+            });
           } catch { /* TUI may not be active */ }
-          if (getPendingCount(queue) === 0) showedEmptyToast = true;
-        }
-
-        const remaining = queue.filter((item) => item.status !== "sent");
-        queueBySession.set(sessionID, remaining);
-
-        if (!showedEmptyToast) {
+          await sleep(delay);
+          next.status = "queued";
+        } else {
+          next.retries = attempts;
+          next.lastError = errMsg;
+          next.status = "failed";
           try {
-            await showToast(sessionID, remaining.length === 0);
+            await client.tui.showToast({
+              body: {
+                title: "Message Queue",
+                message: `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`,
+                variant: "error",
+                duration: toastDurationMs,
+              },
+            });
           } catch { /* TUI may not be active */ }
+          break;
         }
-        schedulePersist();
+      }
+    }
+
+    schedulePersist();
+    const pendingAfterSend = getPendingCount(queue);
+    if (pendingAfterSend > 0) {
+      try {
+        await showToast(sessionID);
+      } catch { /* TUI may not be active */ }
+    } else {
+      showedEmptyToast = true;
+    }
+  }
+
+  const remaining = queue.filter((item) => item.status !== "sent");
+  queueBySession.set(sessionID, remaining);
+
+  if (showedEmptyToast) {
+    await sleep(1500);
+    try {
+      await showToast(sessionID, remaining.length === 0);
+    } catch { /* TUI may not be active */ }
+  }
+  schedulePersist();
       } finally {
         draining.delete(sessionID);
       }
