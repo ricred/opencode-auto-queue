@@ -15,6 +15,8 @@ interface AutoQueueOptions {
   retryMaxDelayMs?: number;
   maxQueueSize?: number;
   drainDelayMs?: number;
+  errorDelayMs?: number;
+  showEmptyToast?: boolean;
   autoRetryOnIdle?: boolean;
   persistQueue?: boolean;
   persistPath?: string;
@@ -257,6 +259,8 @@ export const AutoQueuePlugin = {
       retryMaxDelayMs = 30_000,
       maxQueueSize = 100,
       drainDelayMs = 500,
+      errorDelayMs = 1000,
+      showEmptyToast = true,
       autoRetryOnIdle = true,
       persistQueue = true,
       persistPath = "",
@@ -270,13 +274,13 @@ export const AutoQueuePlugin = {
 
     const resolvedPersistPath = persistPath || `${ctx.directory}/.git/queue.json`;
 
-    let currentMode: string = defaultMode;
-    const busyBySession = new Map<string, boolean>();
-    const queueBySession = new Map<string, QueuedItem[]>();
-    const draining = new Set<string>();
-    const pausedBySession = new Set<string>();
-    let persistTimer: ReturnType<typeof setTimeout> | null = null;
-    let lastWrittenHash: string = "";
+     let currentMode: string = defaultMode;
+     const busyBySession = new Map<string, boolean>();
+     const queueBySession = new Map<string, QueuedItem[]>();
+     const draining = new Set<string>();
+     const pausedBySession = new Set<string>();
+     let persistTimer: ReturnType<typeof setTimeout> | null = null;
+     let lastWrittenHash: string = "";
 
     async function persistState() {
       if (!persistQueue) return;
@@ -449,7 +453,7 @@ export const AutoQueuePlugin = {
           next.retries = attempts;
           next.lastError = errMsg;
           next.status = "failed";
-          const delay = BackoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
+           const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
           try {
             await client.tui.showToast({
               body: {
@@ -478,30 +482,34 @@ export const AutoQueuePlugin = {
           } catch { /* TUI may not be active */ }
           break;
         }
-      }
-    }
+       }
+     }
 
-    schedulePersist();
-    const pendingAfterSend = getPendingCount(queue);
-    if (pendingAfterSend > 0) {
-      try {
-        await showToast(sessionID);
-      } catch { /* TUI may not be active */ }
-    } else {
-      showedEmptyToast = true;
-    }
-  }
+       // After any message that failed to send (whether max retries or non-transient), wait before continuing
+       if (!sent && errorDelayMs > 0) {
+         await sleep(errorDelayMs);
+       }
 
-  const remaining = queue.filter((item) => item.status !== "sent");
-  queueBySession.set(sessionID, remaining);
+      schedulePersist();
+      const pendingAfterSend = getPendingCount(queue);
+     if (pendingAfterSend > 0) {
+       try {
+         await showToast(sessionID);
+       } catch { /* TUI may not be active */ }
+     } else {
+       showedEmptyToast = true;
+     }
 
-  if (showedEmptyToast) {
-    await sleep(1500);
-    try {
-      await showToast(sessionID, remaining.length === 0);
-    } catch { /* TUI may not be active */ }
-  }
-  schedulePersist();
+     const remaining = queue.filter((item) => item.status !== "sent");
+     queueBySession.set(sessionID, remaining);
+
+     if (showedEmptyToast && showEmptyToast) {
+       await sleep(1500);
+       try {
+         await showToast(sessionID, remaining.length === 0);
+       } catch { /* TUI may not be active */ }
+     }
+     schedulePersist();
       } finally {
         draining.delete(sessionID);
       }
@@ -1019,8 +1027,6 @@ export const AutoQueuePlugin = {
       }
     }
 
-    if (draining.has(input.sessionID)) return;
-
     const textParts = parts.filter((p: any) => p.type === "text");
     const allSystemReminders = textParts.every((p: any) =>
       typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
@@ -1030,14 +1036,16 @@ export const AutoQueuePlugin = {
     const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
     if (allSynthetic) return;
 
-    const busy = isBusy(input.sessionID);
-    if (!busy) {
-      markBusy(input.sessionID);
-      return;
-    }
+     // Determine if we should send this message immediately or queue it
+     const busy = isBusy(input.sessionID);
+     const queue = getQueue(input.sessionID);
+     // If session is idle and there are no queued messages, send this message immediately
+     if (!busy && queue.length === 0) {
+       markBusy(input.sessionID);
+       return;
+     }
 
-    const queue = getQueue(input.sessionID);
-    if (queue.length >= maxQueueSize) {
+     if (queue.length >= maxQueueSize) {
       try {
         await client.tui.showToast({
           body: {
