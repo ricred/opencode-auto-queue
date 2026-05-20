@@ -275,10 +275,11 @@ export const AutoQueuePlugin = {
     const resolvedPersistPath = persistPath || `${ctx.directory}/.git/queue.json`;
 
      let currentMode: string = defaultMode;
-     const busyBySession = new Map<string, boolean>();
-     const queueBySession = new Map<string, QueuedItem[]>();
-     const draining = new Set<string>();
-     const pausedBySession = new Set<string>();
+  const busyBySession = new Map<string, boolean>();
+  const sendingBySession = new Set<string>();
+  const queueBySession = new Map<string, QueuedItem[]>();
+  const draining = new Set<string>();
+  const pausedBySession = new Set<string>();
      let persistTimer: ReturnType<typeof setTimeout> | null = null;
      let lastWrittenHash: string = "";
 
@@ -409,8 +410,9 @@ export const AutoQueuePlugin = {
       if (pausedBySession.has(sessionID)) return;
       const queue = queueBySession.get(sessionID) ?? [];
       if (queue.length === 0) return;
-      draining.add(sessionID);
-      try {
+  draining.add(sessionID);
+  markBusy(sessionID);
+  try {
         if (drainDelayMs > 0) await sleep(drainDelayMs);
         let showedEmptyToast = false;
         while (true) {
@@ -444,84 +446,87 @@ export const AutoQueuePlugin = {
                   parts: markInternalParts(next.parts),
                 },
               });
-        next.status = "sent";
-        next.lastError = undefined;
-        sent = true;
-      } catch (error: any) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        if (isTransientError(error) && attempts < maxAttempts) {
-          next.retries = attempts;
-          next.lastError = errMsg;
-          next.status = "failed";
-           const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
-          try {
-            await client.tui.showToast({
-              body: {
-                title: "Message Queue",
-                message: `Retrying "${truncatePreview(next.preview)}" in ${Math.round(delay / 1000)}s (attempt ${attempts}/${maxRetries})\nError: ${errMsg.slice(0, 80)}`,
-                variant: "warning",
-                duration: delay + 2000,
-              },
-            });
-          } catch { /* TUI may not be active */ }
-          await sleep(delay);
-          next.status = "queued";
-        } else {
-          next.retries = attempts;
-          next.lastError = errMsg;
-          next.status = "failed";
-          try {
-            await client.tui.showToast({
-              body: {
-                title: "Message Queue",
-                message: `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`,
-                variant: "error",
-                duration: toastDurationMs,
-              },
-            });
-          } catch { /* TUI may not be active */ }
-          break;
+              next.status = "sent";
+              next.lastError = undefined;
+              sent = true;
+            } catch (error: any) {
+              const errMsg = error instanceof Error ? error.message : String(error);
+              if (isTransientError(error) && attempts < maxAttempts) {
+                next.retries = attempts;
+                next.lastError = errMsg;
+                next.status = "failed";
+                const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
+                try {
+                  await client.tui.showToast({
+                    body: {
+                      title: "Message Queue",
+                      message: `Retrying "${truncatePreview(next.preview)}" in ${Math.round(delay / 1000)}s (attempt ${attempts}/${maxRetries})\nError: ${errMsg.slice(0, 80)}`,
+                      variant: "warning",
+                      duration: delay + 2000,
+                    },
+                  });
+                } catch { /* TUI may not be active */ }
+                await sleep(delay);
+                next.status = "queued";
+              } else {
+                next.retries = attempts;
+                next.lastError = errMsg;
+                next.status = "failed";
+                try {
+                  await client.tui.showToast({
+                    body: {
+                      title: "Message Queue",
+                      message: `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`,
+                      variant: "error",
+                      duration: toastDurationMs,
+                    },
+                  });
+                } catch { /* TUI may not be active */ }
+                break;
+              }
+            }
+          }
+
+          // After any message that failed to send (whether max retries or non-transient), wait before continuing
+          if (!sent && errorDelayMs > 0) {
+            await sleep(errorDelayMs);
+          }
+
+          schedulePersist();
+          const pendingAfterSend = getPendingCount(queue);
+          if (pendingAfterSend > 0) {
+            try {
+              await showToast(sessionID);
+            } catch { /* TUI may not be active */ }
+          } else {
+            showedEmptyToast = true;
+          }
         }
-       }
-     }
 
-       // After any message that failed to send (whether max retries or non-transient), wait before continuing
-       if (!sent && errorDelayMs > 0) {
-         await sleep(errorDelayMs);
-       }
+        const remaining = queue.filter((item) => item.status !== "sent");
+        queueBySession.set(sessionID, remaining);
 
+        if (showedEmptyToast && showEmptyToast) {
+          await sleep(1500);
+          try {
+            await showToast(sessionID, remaining.length === 0);
+          } catch { /* TUI may not be active */ }
+        }
       schedulePersist();
-      const pendingAfterSend = getPendingCount(queue);
-     if (pendingAfterSend > 0) {
-       try {
-         await showToast(sessionID);
-       } catch { /* TUI may not be active */ }
-     } else {
-       showedEmptyToast = true;
-     }
-
-     const remaining = queue.filter((item) => item.status !== "sent");
-     queueBySession.set(sessionID, remaining);
-
-     if (showedEmptyToast && showEmptyToast) {
-       await sleep(1500);
-       try {
-         await showToast(sessionID, remaining.length === 0);
-       } catch { /* TUI may not be active */ }
-     }
-     schedulePersist();
-      } finally {
-        draining.delete(sessionID);
-      }
+  } finally {
+    draining.delete(sessionID);
+    sendingBySession.delete(sessionID);
+  }
     }
 
-    function isBusy(sessionID: string): boolean {
-      return busyBySession.get(sessionID) ?? false;
-    }
+  function isBusy(sessionID: string): boolean {
+    return busyBySession.get(sessionID) === true || sendingBySession.has(sessionID);
+  }
 
-    function markBusy(sessionID: string) {
-      busyBySession.set(sessionID, true);
-    }
+  function markBusy(sessionID: string) {
+    busyBySession.set(sessionID, true);
+    sendingBySession.add(sessionID);
+  }
 
     function makeTextItem(sessionID: string, text: string): QueuedItem {
       const truncate = makeTruncate(previewLength);
@@ -989,23 +994,25 @@ export const AutoQueuePlugin = {
       },
 
   event: async ({ event }: { event: any }) => {
-    if (event.type === "session.status") {
-      const { sessionID, status } = event.properties;
-      const busy = status.type !== "idle";
-      busyBySession.set(sessionID, busy);
-      if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
-        await drain(sessionID);
-      }
-      return;
-    }
+        if (event.type === "session.status") {
+          const { sessionID, status } = event.properties;
+          const busy = status.type !== "idle";
+          busyBySession.set(sessionID, busy);
+          if (busy) sendingBySession.add(sessionID);
+          if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
+            await drain(sessionID);
+          }
+          return;
+        }
 
-    if (event.type === "session.idle") {
-      const { sessionID } = event.properties;
-      busyBySession.set(sessionID, false);
-      if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
-        await drain(sessionID);
-      }
-    }
+        if (event.type === "session.idle") {
+          const { sessionID } = event.properties;
+          busyBySession.set(sessionID, false);
+          sendingBySession.delete(sessionID);
+          if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
+            await drain(sessionID);
+          }
+        }
   },
 
   "chat.message": async (input: any, output: any) => {
@@ -1037,13 +1044,16 @@ export const AutoQueuePlugin = {
     if (allSynthetic) return;
 
      // Determine if we should send this message immediately or queue it
-     const busy = isBusy(input.sessionID);
-     const queue = getQueue(input.sessionID);
-     // If session is idle and there are no queued messages, send this message immediately
-     if (!busy && queue.length === 0) {
-       markBusy(input.sessionID);
-       return;
-     }
+      const busy = isBusy(input.sessionID);
+      const queue = getQueue(input.sessionID);
+      if (!busy) {
+        markBusy(input.sessionID);
+        const hasPending = queue.some((item) => item.status === "queued" || item.status === "sending" || item.status === "failed");
+        if (hasPending && currentMode === "immediate" && !pausedBySession.has(input.sessionID)) {
+          drain(input.sessionID).catch(() => {});
+        }
+        return;
+      }
 
      if (queue.length >= maxQueueSize) {
       try {
