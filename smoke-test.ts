@@ -74,6 +74,18 @@ function check(name: string, cond: boolean, detail = "") {
   check("drop actually removed item", /^1 messages/.test(cnt), cnt);
 }
 
+// 0c) REGRESSION: stale persisted mode "hold" must NOT override immediate default
+{
+  const dir2 = dir + "-hold";
+  rmSync(dir2, { recursive: true, force: true });
+  mkdirSync(`${dir2}\\.git`, { recursive: true });
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(`${dir2}\\.git\\queue.json`, JSON.stringify({ version: 1, mode: "hold", queues: {}, pausedSessions: [] }));
+  const hooks2: any = await (AutoQueuePlugin as any).server({ client, directory: dir2 }, { drainDelayMs: 5 });
+  const cfg2 = await hooks2.tool.queue.execute({ action: "config" }, { sessionID: "sY" });
+  check("persisted hold does not override immediate default", /mode: immediate/.test(cfg2), cfg2.split("\n").find((l: string) => l.includes("mode:")));
+}
+
 // 1) First message while idle: passes through (marks session busy)
 const out1: any = { parts: [{ type: "text", text: "first task", id: "p1", messageID: "m0", sessionID: "s1" }], message: { agent: "build", model: { providerID: "zai-proxy", modelID: "glm5.3-flash" } } };
 await hooks["chat.message"]({ sessionID: "s1", agent: "build", model: out1.message.model }, out1);

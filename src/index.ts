@@ -311,7 +311,8 @@ export const AutoQueuePlugin = {
       if (!persistQueue) return;
       const state = await loadState(resolvedPersistPath);
       if (!state) return;
-      if (state.mode === "hold" || state.mode === "immediate") currentMode = state.mode;
+      // Mode is runtime-only: the configured default wins on startup. A stale
+      // persisted "hold" must not disable auto-drain after an upgrade.
       if (state.pausedSessions) {
         for (const s of state.pausedSessions) pausedBySession.add(s);
       }
@@ -326,9 +327,7 @@ export const AutoQueuePlugin = {
     async function reloadFromDisk() {
       const state = await loadState(resolvedPersistPath);
       if (!state) return;
-      if (state.mode === "hold" || state.mode === "immediate") {
-        currentMode = state.mode;
-      }
+      // Mode is runtime-only (see restoreState).
       pausedBySession.clear();
       if (state.pausedSessions) {
         for (const s of state.pausedSessions) pausedBySession.add(s);
