@@ -449,7 +449,7 @@ export const AutoQueuePlugin = {
           next.retries = attempts;
           next.lastError = errMsg;
           next.status = "failed";
-          const delay = BackoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
+          const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
           try {
             await client.tui.showToast({
               body: {
