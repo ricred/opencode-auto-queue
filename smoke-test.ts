@@ -36,13 +36,42 @@ const client: any = {
 
 const hooks: any = await (AutoQueuePlugin as any).server(
   { client, directory: dir },
-  { defaultMode: "immediate", drainDelayMs: 5, retryBaseDelayMs: 10, retryMaxDelayMs: 50, persistDebounceMs: 10, toastDurationMs: 100 },
+  { drainDelayMs: 5, retryBaseDelayMs: 10, retryMaxDelayMs: 50, persistDebounceMs: 10, toastDurationMs: 100 },
 );
 
 let failures = 0;
 function check(name: string, cond: boolean, detail = "") {
   console.log(`${cond ? "PASS" : "FAIL"}  ${name}${detail ? "  -> " + detail : ""}`);
   if (!cond) failures++;
+}
+
+// 0) DEFAULT MODE: immediate (regression for "queue never deploys" hold-mode bug)
+{
+  const out = { parts: [{ type: "text", text: "x", id: "p", messageID: "m", sessionID: "sX" }] };
+  await hooks["command.execute.before"]({ command: "queue", sessionID: "sX", arguments: "modecheck" }, out as any).catch(() => {});
+  const cfgText = await hooks.tool.queue.execute({ action: "config" }, { sessionID: "sX" });
+  check("default mode is immediate", /mode: immediate/.test(cfgText), cfgText.split("\n").find((l: string) => l.includes("mode:")));
+}
+
+// 0b) /queue list + /queue drop N intercepted in command.execute.before (busy-safe),
+//     aliases list->status, drop->delete; unknown action falls through to agent.
+{
+  const q = hooks.tool.queue;
+  await q.execute({ action: "append", text: "queued task A" }, { sessionID: "sC" });
+  await q.execute({ action: "append", text: "queued task B" }, { sessionID: "sC" });
+  const outList: any = { parts: [{ type: "text", text: "placeholder" }] };
+  await hooks["command.execute.before"]({ command: "queue", sessionID: "sC", arguments: "list" }, outList);
+  check("/queue list intercepted (alias -> status), shows 2 items",
+    outList.parts[0]?.metadata?.__auto_queue_internal === true && /Queued: 2/.test(outList.parts[0].text), outList.parts[0].text.split("\n")[3]);
+  const outDrop: any = { parts: [{ type: "text", text: "placeholder" }] };
+  await hooks["command.execute.before"]({ command: "queue", sessionID: "sC", arguments: "drop 1" }, outDrop);
+  check("/queue drop 1 intercepted (alias -> delete), removed task A",
+    outDrop.parts[0]?.metadata?.__auto_queue_internal === true && /Deleted: queued task A/.test(outDrop.parts[0].text), outDrop.parts[0].text);
+  const outBogus: any = { parts: [{ type: "text", text: "untouched" }] };
+  await hooks["command.execute.before"]({ command: "queue", sessionID: "sC", arguments: "frobnicate" }, outBogus);
+  check("/queue <unknown> falls through to agent (parts untouched)", outBogus.parts[0].text === "untouched");
+  const cnt = await q.execute({ action: "count" }, { sessionID: "sC" });
+  check("drop actually removed item", /^1 messages/.test(cnt), cnt);
 }
 
 // 1) First message while idle: passes through (marks session busy)
