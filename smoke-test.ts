@@ -45,6 +45,10 @@ function check(name: string, cond: boolean, detail = "") {
   if (!cond) failures++;
 }
 
+function mkOut(text: string): any {
+  return { parts: [{ type: "text", text, id: "px", messageID: "m1", sessionID: "s1" }], message: { agent: "build", model: { providerID: "zai-proxy", modelID: "glm5.3-flash" } } };
+}
+
 // 0) DEFAULT MODE: immediate (regression for "queue never deploys" hold-mode bug)
 {
   const out = { parts: [{ type: "text", text: "x", id: "p", messageID: "m", sessionID: "sX" }] };
@@ -86,15 +90,56 @@ function check(name: string, cond: boolean, detail = "") {
   check("persisted hold does not override immediate default", /mode: immediate/.test(cfg2), cfg2.split("\n").find((l: string) => l.includes("mode:")));
 }
 
+// 0d) REGRESSION: drain must refuse while busy (silent message loss path),
+//     /queue-immediate while busy sends nothing, idle event then drains,
+//     malformed events do not throw
+{
+  const s = "sBusy";
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: s, status: { type: "busy" } } } });
+  await hooks["chat.message"]({ sessionID: s }, mkOut("busy msg 1"));
+  await hooks.event({ event: { type: "session.status", properties: {} } });
+  await hooks.event({ event: { type: "session.idle", properties: {} } });
+  const before = prompts.length;
+  await hooks["command.execute.before"]({ command: "queue", sessionID: s, arguments: "hold" }, { parts: [] } as any);
+  await hooks["command.execute.before"]({ command: "queue", sessionID: s, arguments: "immediate" }, { parts: [] } as any);
+  await new Promise((r) => setTimeout(r, 30));
+  check("drain refuses while busy (no silent send)", prompts.length === before, `prompts=${prompts.length}`);
+  await hooks.event({ event: { type: "session.status", properties: { sessionID: s, status: { type: "idle" } } } });
+  await new Promise((r) => setTimeout(r, 40));
+  check("idle after busy drains queued items", prompts.length === before + 1, `prompts ${before}->${prompts.length}`);
+}
+
+// 0e) REGRESSION: toast durations - enqueue toast 10s default (was 24h sticky), failed toast 60s
+{
+  const toasts2: any[] = [];
+  const client2: any = {
+    session: { prompt: async () => { throw new Error("bad request"); } },
+    tui: { showToast: async (args: any) => { toasts2.push(args); return {}; } },
+  };
+  const dir3 = dir + "-toast";
+  rmSync(dir3, { recursive: true, force: true });
+  mkdirSync(`${dir3}\\.git`, { recursive: true });
+  const h3: any = await (AutoQueuePlugin as any).server(
+    { client: client2, directory: dir3 },
+    { drainDelayMs: 5, retryBaseDelayMs: 5, retryMaxDelayMs: 10, persistDebounceMs: 10 },
+  );
+  await h3.event({ event: { type: "session.status", properties: { sessionID: "sT", status: { type: "busy" } } } });
+  await h3["chat.message"]({ sessionID: "sT" }, mkOut("toast dur check"));
+  await new Promise((r) => setTimeout(r, 10));
+  const queueToast = toasts2.find((t) => (t.body?.message ?? "").includes("toast dur check"));
+  check("enqueue toast uses 10s default (was 24h)", !!queueToast && queueToast.body.duration === 10_000, `duration=${queueToast?.body?.duration}`);
+  await h3.event({ event: { type: "session.status", properties: { sessionID: "sT", status: { type: "idle" } } } });
+  await new Promise((r) => setTimeout(r, 80));
+  const failedToast = toasts2.find((t) => /Failed/.test(t.body?.message ?? ""));
+  check("failed toast uses 60s default", !!failedToast && failedToast.body.duration === 60_000, `duration=${failedToast?.body?.duration}`);
+}
+
 // 1) First message while idle: passes through (marks session busy)
 const out1: any = { parts: [{ type: "text", text: "first task", id: "p1", messageID: "m0", sessionID: "s1" }], message: { agent: "build", model: { providerID: "zai-proxy", modelID: "glm5.3-flash" } } };
 await hooks["chat.message"]({ sessionID: "s1", agent: "build", model: out1.message.model }, out1);
 check("idle message passes through untouched", out1.parts.length === 1 && out1.parts[0].text === "first task");
 
 // 2) Two messages while busy: get queued + replaced by ignored placeholder
-function mkOut(text: string): any {
-  return { parts: [{ type: "text", text, id: "px", messageID: "m1", sessionID: "s1" }], message: { agent: "build", model: { providerID: "zai-proxy", modelID: "glm5.3-flash" } } };
-}
 const out2 = mkOut("second task");
 await hooks["chat.message"]({ sessionID: "s1" }, out2);
 check("busy message #1 queued (parts replaced by ignored placeholder)", out2.parts.length === 1 && out2.parts[0].ignored === true, JSON.stringify(out2.parts[0]?.text ?? ""));
@@ -118,12 +163,13 @@ check("/queue-status intercepted instantly, not queued", out4.parts.length === 1
 
 // 5) Idle drain with transient failure -> retry succeeds (exercises backoffDelay fix)
 failFirstPrompt = true;
+const beforeRetry = prompts.length;
 await hooks.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } });
 await Bun.sleep(400); // drainDelay 5ms + backoff ~10-20ms + margin
-check("drain sent 1 prompt after retry", prompts.length === 1, `prompts=${prompts.length}`);
-if (prompts.length === 1) {
-  const body = prompts[0].body;
-  check("prompt targets session s1", prompts[0].path?.id === "s1");
+check("drain sent 1 prompt after retry", prompts.length === beforeRetry + 1, `prompts=${prompts.length}`);
+if (prompts.length === beforeRetry + 1) {
+  const body = prompts[beforeRetry].body;
+  check("prompt targets session s1", prompts[beforeRetry].path?.id === "s1");
   check("prompt parts carry internal marker", body.parts.some((p: any) => p.metadata?.__auto_queue_internal === true));
   check("prompt preserves queued text", body.parts.some((p: any) => p.type === "text" && p.text === "third task"));
   check("prompt preserves agent/model", body.agent === "build" && body.model?.modelID === "glm5.3-flash");

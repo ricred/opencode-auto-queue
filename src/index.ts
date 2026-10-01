@@ -246,8 +246,9 @@ export const AutoQueuePlugin = {
     const client = ctx.client;
 
     const {
-      toastDurationMs = 86_400_000,
+      toastDurationMs = 10_000,
       emptyToastDurationMs = 4_000,
+      failedToastDurationMs = 60_000,
       maxPreviews = 3,
       previewLength = 28,
       placeholderTemplate = "Queued; {count} pending",
@@ -402,6 +403,9 @@ export const AutoQueuePlugin = {
     async function drain(sessionID: string) {
       if (draining.has(sessionID)) return;
       if (pausedBySession.has(sessionID)) return;
+      // Never prompt a busy session: OpenCode accepts the request but no turn
+      // is created, so items would be marked "sent" while silently lost.
+      if (isBusy(sessionID)) return;
       const queue = queueBySession.get(sessionID) ?? [];
       if (queue.length === 0) return;
       draining.add(sessionID);
@@ -410,7 +414,15 @@ export const AutoQueuePlugin = {
         let showedEmptyToast = false;
         while (true) {
           if (pausedBySession.has(sessionID)) break;
-          const next = queue.find((item) => item.status === "queued" || (item.status === "failed" && autoRetryOnIdle));
+          // Failed items are retried across drains (autoRetryOnIdle) but only
+          // up to maxRetries total attempts; otherwise one permanently failing
+          // item (e.g. 400 Bad Request) would be re-picked in a tight infinite
+          // loop, wedge the drain, and block the whole queue.
+          const next = queue.find(
+            (item) =>
+              item.status === "queued" ||
+              (item.status === "failed" && autoRetryOnIdle && (item.retries ?? 0) < maxRetries),
+          );
           if (!next) {
             const failedOnly = queue.find((item) => item.status === "failed");
             if (failedOnly) break;
@@ -445,7 +457,7 @@ export const AutoQueuePlugin = {
       } catch (error: any) {
         const errMsg = error instanceof Error ? error.message : String(error);
         if (isTransientError(error) && attempts < maxAttempts) {
-          next.retries = attempts;
+          next.retries = (next.retries ?? 0) + attempts;
           next.lastError = errMsg;
           next.status = "failed";
           const delay = backoffDelay(attempts - 1, retryBaseDelayMs, retryMaxDelayMs);
@@ -462,7 +474,9 @@ export const AutoQueuePlugin = {
           await sleep(delay);
           next.status = "queued";
         } else {
-          next.retries = attempts;
+          // Monotonic total-attempt counter: the outer loop re-picks failed
+          // items, so a reset-per-visit counter would never reach the cap.
+          next.retries = (next.retries ?? 0) + attempts;
           next.lastError = errMsg;
           next.status = "failed";
           try {
@@ -471,7 +485,7 @@ export const AutoQueuePlugin = {
                 title: "Message Queue",
                 message: `Failed "${truncatePreview(next.preview)}" after ${attempts} attempts: ${errMsg.slice(0, 100)}`,
                 variant: "error",
-                duration: toastDurationMs,
+                duration: failedToastDurationMs,
               },
             });
           } catch { /* TUI may not be active */ }
@@ -997,22 +1011,28 @@ export const AutoQueuePlugin = {
       },
 
   event: async ({ event }: { event: any }) => {
-    if (event.type === "session.status") {
-      const { sessionID, status } = event.properties;
-      const busy = status.type !== "idle";
-      busyBySession.set(sessionID, busy);
-      if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
-        await drain(sessionID);
+    try {
+      if (event.type === "session.status") {
+        const { sessionID, status } = event.properties ?? {};
+        if (typeof sessionID !== "string") return;
+        const busy = status?.type !== "idle";
+        busyBySession.set(sessionID, busy);
+        if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
+          await drain(sessionID);
+        }
+        return;
       }
-      return;
-    }
 
-    if (event.type === "session.idle") {
-      const { sessionID } = event.properties;
-      busyBySession.set(sessionID, false);
-      if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
-        await drain(sessionID);
+      if (event.type === "session.idle") {
+        const { sessionID } = event.properties ?? {};
+        if (typeof sessionID !== "string") return;
+        busyBySession.set(sessionID, false);
+        if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
+          await drain(sessionID);
+        }
       }
+    } catch {
+      // A malformed event must not kill the handler (subsequent events would be lost).
     }
   },
 
