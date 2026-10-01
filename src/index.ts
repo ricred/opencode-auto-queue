@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import { watchFile, unwatchFile, existsSync, mkdirSync } from "node:fs";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 
 interface AutoQueueOptions {
@@ -98,7 +98,11 @@ async function saveState(filePath: string, state: PersistedState): Promise<void>
   try {
     const dir = dirname(filePath);
     await mkdir(dir, { recursive: true });
-    await writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
+    // Atomic write: a crash mid-write must never leave a truncated (unparseable)
+    // queue file behind — that would silently discard the persisted queue.
+    const tmp = `${filePath}.tmp`;
+    await writeFile(tmp, JSON.stringify(state, null, 2), "utf-8");
+    await rename(tmp, filePath);
   } catch {
     // persistence failure is non-fatal
   }
@@ -273,11 +277,20 @@ export const AutoQueuePlugin = {
 
     let currentMode: string = defaultMode;
     const busyBySession = new Map<string, boolean>();
+    // Timestamp of the last observed idle event per session. The deferred
+    // drain continuation only continues when an idle was observed AFTER the
+    // send — the busy map alone can be stale if no status event fired.
+    const lastIdleAt = new Map<string, number>();
     const queueBySession = new Map<string, QueuedItem[]>();
     const draining = new Set<string>();
     const pausedBySession = new Set<string>();
     let persistTimer: ReturnType<typeof setTimeout> | null = null;
     let lastWrittenHash: string = "";
+    // Non-null while a debounced save is in flight. The reload path must await
+    // it: lastWrittenHash is assigned BEFORE the async write lands, so a
+    // reload that reads pre-save disk content would see a mismatched hash and
+    // apply stale state over newer in-memory data (proven by repro).
+    let savePromise: Promise<void> | null = null;
 
     async function persistState() {
       if (!persistQueue) return;
@@ -296,7 +309,10 @@ export const AutoQueuePlugin = {
       const hash = Bun.hash(json).toString();
       if (hash === lastWrittenHash) return;
       lastWrittenHash = hash;
-      await saveState(resolvedPersistPath, state);
+      savePromise = saveState(resolvedPersistPath, state).finally(() => {
+        savePromise = null;
+      });
+      await savePromise;
     }
 
     function schedulePersist() {
@@ -326,16 +342,35 @@ export const AutoQueuePlugin = {
     }
 
     async function reloadFromDisk() {
+      // Flush unsaved in-memory changes BEFORE reading disk, so an external
+      // file change (or our own write echo) cannot revert state that has not
+      // been persisted yet.
+      if (persistTimer) {
+        clearTimeout(persistTimer);
+        persistTimer = null;
+        await persistState();
+      }
+      // A debounced save may be mid-flight (timer already fired): wait for it
+      // so loadState reads post-save content, never the stale pre-save file.
+      if (savePromise) await savePromise;
       const state = await loadState(resolvedPersistPath);
       if (!state) return;
+      // Our own write echo: in-memory state is already authoritative.
+      const hash = Bun.hash(JSON.stringify(state, null, 2)).toString();
+      if (hash === lastWrittenHash) return;
       // Mode is runtime-only (see restoreState).
       pausedBySession.clear();
       if (state.pausedSessions) {
         for (const s of state.pausedSessions) pausedBySession.add(s);
       }
-      queueBySession.clear();
+      // Never replace the queue of a session whose drain is in flight: drain
+      // holds a live reference and writes authoritative state when it finishes.
+      for (const sid of [...queueBySession.keys()]) {
+        if (!draining.has(sid)) queueBySession.delete(sid);
+      }
       if (state.queues) {
         for (const [sessionID, items] of Object.entries(state.queues)) {
+          if (draining.has(sessionID)) continue;
           const queue = deserializeQueue(items);
           if (queue.length > 0) queueBySession.set(sessionID, queue);
         }
@@ -437,6 +472,10 @@ export const AutoQueuePlugin = {
           let sent = false;
           let attempts = 0;
           const maxAttempts = maxRetries + 1;
+          // Captured BEFORE the prompt await: any idle event observed while
+          // the prompt is in flight (turn completing server-side) must count
+          // as "idle after this send" for the deferred continuation.
+          const sendStart = Date.now();
 
           while (!sent && attempts < maxAttempts) {
             attempts++;
@@ -491,8 +530,30 @@ export const AutoQueuePlugin = {
           } catch { /* TUI may not be active */ }
           break;
         }
+        }
       }
-    }
+      // ^ close catch, then close the INNER retry while — the if(sent) below
+      // must sit BETWEEN the loops so its break exits the OUTER send loop.
+
+      if (sent) {
+        // One item per pass: session.prompt may resolve before the agent turn
+        // completes. Sending the next item immediately would target a busy
+        // session (accepted but no turn created = silent loss — the original
+        // production incident). The next idle event re-triggers the drain;
+        // the deferred attempt covers prompt-resolves-after-completion, where
+        // no new idle event will fire — but only when an idle event was
+        // observed AFTER this send (busy map alone can be stale).
+        setTimeout(() => {
+          if (
+            !pausedBySession.has(sessionID) &&
+            !isBusy(sessionID) &&
+            (lastIdleAt.get(sessionID) ?? 0) > sendStart
+          ) {
+            drain(sessionID).catch(() => {});
+          }
+        }, Math.max(drainDelayMs, 50) + 50);
+        break;
+      }
 
     schedulePersist();
     const pendingAfterSend = getPendingCount(queue);
@@ -503,7 +564,7 @@ export const AutoQueuePlugin = {
     } else {
       showedEmptyToast = true;
     }
-  }
+    }
 
   const remaining = queue.filter((item) => item.status !== "sent");
   queueBySession.set(sessionID, remaining);
@@ -521,7 +582,10 @@ export const AutoQueuePlugin = {
     }
 
     function isBusy(sessionID: string): boolean {
-      return busyBySession.get(sessionID) ?? false;
+      // An in-flight drain implies the session is (or is about to be) busy:
+      // messages arriving meanwhile must be queued, not passed through raw
+      // into a session with a turn starting (silent-loss class).
+      return !!busyBySession.get(sessionID) || draining.has(sessionID);
     }
 
     function markBusy(sessionID: string) {
@@ -1017,6 +1081,7 @@ export const AutoQueuePlugin = {
         if (typeof sessionID !== "string") return;
         const busy = status?.type !== "idle";
         busyBySession.set(sessionID, busy);
+        if (!busy) lastIdleAt.set(sessionID, Date.now());
         if (!busy && currentMode === "immediate" && !pausedBySession.has(sessionID)) {
           await drain(sessionID);
         }
@@ -1027,6 +1092,7 @@ export const AutoQueuePlugin = {
         const { sessionID } = event.properties ?? {};
         if (typeof sessionID !== "string") return;
         busyBySession.set(sessionID, false);
+        lastIdleAt.set(sessionID, Date.now());
         if (currentMode === "immediate" && !pausedBySession.has(sessionID)) {
           await drain(sessionID);
         }
@@ -1055,7 +1121,9 @@ export const AutoQueuePlugin = {
       }
     }
 
-    if (draining.has(input.sessionID)) return;
+    // NOTE: no early return for draining sessions — with isBusy() covering the
+    // drain window, messages arriving mid-drain are queued like any busy-turn
+    // message instead of passing through raw (silent-loss class).
 
     const textParts = parts.filter((p: any) => p.type === "text");
     const allSystemReminders = textParts.every((p: any) =>

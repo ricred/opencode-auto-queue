@@ -5,7 +5,7 @@
  * Run: bun smoke-test.ts
  */
 import { AutoQueuePlugin } from "./dist/index.js";
-import { existsSync, rmSync, mkdirSync } from "node:fs";
+import { existsSync, rmSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 const dir = "C:\\Users\\ricka\\AppData\\Local\\Temp\\opencode\\aq-smoke";
 rmSync(dir, { recursive: true, force: true });
@@ -132,6 +132,119 @@ function mkOut(text: string): any {
   await new Promise((r) => setTimeout(r, 80));
   const failedToast = toasts2.find((t) => /Failed/.test(t.body?.message ?? ""));
   check("failed toast uses 60s default", !!failedToast && failedToast.body.duration === 60_000, `duration=${failedToast?.body?.duration}`);
+}
+
+// 0f) REGRESSION: external file change must not revert unsaved in-memory state
+//     (reloadFromDisk now flushes pending changes before reading)
+{
+  const dirW = dir + "-watch";
+  rmSync(dirW, { recursive: true, force: true });
+  mkdirSync(`${dirW}\\.git`, { recursive: true });
+  const hW: any = await (AutoQueuePlugin as any).server(
+    { client, directory: dirW },
+    { drainDelayMs: 5, persistDebounceMs: 50, watchDebounceMs: 20 },
+  );
+  const sW = "sW";
+  const qFile = `${dirW}\\.git\\queue.json`;
+  await hW.event({ event: { type: "session.status", properties: { sessionID: sW, status: { type: "busy" } } } });
+  await hW["chat.message"]({ sessionID: sW }, mkOut("flush A"));
+  await new Promise((r) => setTimeout(r, 150)); // persisted; watcher reload no-ops
+  const stale = readFileSync(qFile, "utf-8"); // A-only state
+  await hW["chat.message"]({ sessionID: sW }, mkOut("flush B")); // pending, not yet persisted
+  writeFileSync(qFile, stale, "utf-8"); // external touch with STALE content
+  await new Promise((r) => setTimeout(r, 250)); // watcher reload cycle
+  const st = await hW.tool.queue.execute({ action: "status" }, { sessionID: sW });
+  check("external change does not revert unsaved enqueue", /Queued: 2/.test(st) && st.includes("flush B"), (st.split("\n").find((l: string) => l.includes("messages")) ?? st).trim());
+  await new Promise((r) => setTimeout(r, 100)); // let debounce flush settle
+  check("flushed state persisted (B on disk)", readFileSync(qFile, "utf-8").includes("flush B"));
+  check("no .tmp residue after persist", !existsSync(`${qFile}.tmp`));
+}
+
+// 0g) REGRESSION: one item per drain pass - prompt must never land while a
+//     previous turn is still running (mock models 150ms turns; a second call
+//     inside the window = the silent-loss signature)
+{
+  const lost: string[] = [];
+  const sent: string[] = [];
+  let turnActiveUntil = 0;
+  const clientM: any = {
+    session: {
+      prompt: async (args: any) => {
+        const text = args.body?.parts?.find((p: any) => p.type === "text")?.text ?? "?";
+        if (Date.now() < turnActiveUntil) lost.push(text);
+        sent.push(text);
+        turnActiveUntil = Date.now() + 150;
+        await new Promise((r) => setTimeout(r, 10)); // resolves before turn ends
+        return {};
+      },
+    },
+    tui: { showToast: async () => ({}) },
+  };
+  const dirM = dir + "-multi";
+  rmSync(dirM, { recursive: true, force: true });
+  mkdirSync(`${dirM}\\.git`, { recursive: true });
+  const hM: any = await (AutoQueuePlugin as any).server(
+    { client: clientM, directory: dirM },
+    { drainDelayMs: 5, persistDebounceMs: 10 },
+  );
+  const sM = "sM";
+  await hM.event({ event: { type: "session.status", properties: { sessionID: sM, status: { type: "busy" } } } });
+  for (const t of ["m1", "m2", "m3"]) {
+    await hM["chat.message"]({ sessionID: sM }, mkOut(t));
+  }
+  // three turn-end events, spaced past the 150ms turn window + deferred retry
+  for (let i = 0; i < 3; i++) {
+    await new Promise((r) => setTimeout(r, 260));
+    await hM.event({ event: { type: "session.idle", properties: { sessionID: sM } } });
+  }
+  await new Promise((r) => setTimeout(r, 200));
+  check("all 3 items delivered", sent.length === 3 && ["m1", "m2", "m3"].every((t) => sent.includes(t)), `sent=${sent.length}`);
+  check("no prompt landed inside an active turn (silent-loss signature)", lost.length === 0, `lost=[${lost.join(",")}]`);
+}
+
+// 0h) REGRESSION: message arriving DURING a slow drain is queued, not lost
+{
+  // First 2 prompt calls fail transiently, 3rd succeeds -> slow drain with
+  // real backoff windows; item recovers (bounded retries), stays delivered.
+  let calls = 0;
+  const sentTexts: string[] = [];
+  const clientS: any = {
+    session: {
+      prompt: async (args: any) => {
+        const text = args.body?.parts?.find((p: any) => p.type === "text")?.text ?? "?";
+        sentTexts.push(text);
+        if (++calls <= 2) throw new Error("network error: reset");
+        return {};
+      },
+    },
+    tui: { showToast: async () => ({}) },
+  };
+  const dirS = dir + "-slowdrain";
+  rmSync(dirS, { recursive: true, force: true });
+  mkdirSync(`${dirS}\\.git`, { recursive: true });
+  const hS: any = await (AutoQueuePlugin as any).server(
+    { client: clientS, directory: dirS },
+    { drainDelayMs: 5, retryBaseDelayMs: 120, retryMaxDelayMs: 150, maxRetries: 2, persistDebounceMs: 10 },
+  );
+  const sS = "sS";
+  await hS.event({ event: { type: "session.status", properties: { sessionID: sS, status: { type: "busy" } } } });
+  await hS["chat.message"]({ sessionID: sS }, mkOut("slow item"));
+  // Fire WITHOUT await: the idle handler awaits the full drain (~300ms with
+  // backoff); awaiting it here would mean the drain is over before we inject.
+  const drainRun = hS.event({ event: { type: "session.idle", properties: { sessionID: sS } } }).catch(() => {});
+  await new Promise((r) => setTimeout(r, 40)); // attempt 1 failed, drain in backoff (draining=true)
+  // Turn "ends" mid-drain: busy map goes false, drain still in flight
+  await hS.event({ event: { type: "session.status", properties: { sessionID: sS, status: { type: "idle" } } } });
+  const outMid = mkOut("mid-drain msg");
+  await hS["chat.message"]({ sessionID: sS }, outMid);
+  check("mid-drain message queued via draining state (busy map false)", outMid.parts.length === 1 && outMid.parts[0].ignored === true, JSON.stringify(outMid.parts[0]?.text ?? "passthrough"));
+  await drainRun;
+  await new Promise((r) => setTimeout(r, 400)); // attempt 2 (fail), 3 (ok), deferred continuation sends mid-drain msg
+  check("mid-drain message delivered after drain settled", sentTexts.includes("mid-drain msg"), `sent=[${sentTexts.join(",")}]`);
+  const slowAttempts = sentTexts.filter((t) => t === "slow item").length;
+  check("slow item attempts bounded by maxRetries+1 (3)", slowAttempts === 3, `slow attempts=${slowAttempts}`);
+  const st = await hS.tool.queue.execute({ action: "status" }, { sessionID: sS });
+  check("queue fully drained after recovery", /Queued: 0/.test(st) && /Failed: 0/.test(st), (st.split("\n").slice(0, 4).join(" | ")));
 }
 
 // 1) First message while idle: passes through (marks session busy)
