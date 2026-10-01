@@ -348,6 +348,11 @@ export const AutoQueuePlugin = {
     // reload that reads pre-save disk content would see a mismatched hash and
     // apply stale state over newer in-memory data (proven by repro).
     let savePromise: Promise<void> | null = null;
+    // Sessions with in-memory mutations not yet proven durable. reloadFromDisk
+    // must never replace these sessions' queues from disk: the disk content
+    // was loaded asynchronously and cannot contain mutations that landed
+    // during the load await (review F3 — silent message loss window).
+    const dirtySessions = new Set<string>();
 
     async function persistState() {
       if (!persistQueue) return;
@@ -431,16 +436,30 @@ export const AutoQueuePlugin = {
       }
       // Never replace the queue of a session whose drain is in flight: drain
       // holds a live reference and writes authoritative state when it finishes.
+      // Same for DIRTY sessions: their in-memory state contains mutations that
+      // may be younger than the file we just read (review F3).
       for (const sid of [...queueBySession.keys()]) {
-        if (!draining.has(sid)) queueBySession.delete(sid);
+        if (!draining.has(sid) && !dirtySessions.has(sid)) queueBySession.delete(sid);
       }
       if (state.queues) {
         for (const [sessionID, items] of Object.entries(state.queues)) {
-          if (draining.has(sessionID)) continue;
+          if (draining.has(sessionID) || dirtySessions.has(sessionID)) continue;
           const queue = deserializeQueue(items);
           if (queue.length > 0) queueBySession.set(sessionID, queue);
         }
       }
+      // Reconciled: in-memory state is authoritative for every session. A
+      // dirty-skipped session's memory is younger than the file we just read,
+      // so persist immediately — otherwise memory and disk stay divergent
+      // until some unrelated mutation happens (crash before that = loss).
+      dirtySessions.clear();
+      // Re-pin the echo-suppression hash to the content we just loaded.
+      // Without this, the convergence persist below can be dedup-SKIPPED:
+      // memory state may hash equal to lastWrittenHash (our own earlier
+      // write) while the FILE holds different (external) content — the write
+      // never happens and the divergence becomes permanent.
+      lastWrittenHash = Bun.hash(JSON.stringify(state, null, 2)).toString();
+      schedulePersist();
       // No toast here: a disk reload is not a user-visible queue event. The
       // old forced empty-toast fired "Queue empty. All queued messages sent."
       // on EVERY watcher reload — a false success signal (proven live).
@@ -546,13 +565,20 @@ export const AutoQueuePlugin = {
       // Never prompt a busy session: OpenCode accepts the request but no turn
       // is created, so items would be marked "sent" while silently lost.
       if (isBusy(sessionID)) return;
-      const queue = queueBySession.get(sessionID) ?? [];
-      if (queue.length === 0) return;
+      const initialQueue = queueBySession.get(sessionID) ?? [];
+      if (initialQueue.length === 0) return;
       draining.add(sessionID);
+      dirtySessions.add(sessionID);
       try {
         if (drainDelayMs > 0) await sleep(drainDelayMs);
         let showedEmptyToast = false;
         while (true) {
+          // Re-fetch EVERY iteration: clear() swaps the map entry for a new
+          // array. Holding the pre-clear reference resurrected cleared
+          // messages and wiped items enqueued after the clear (review F2).
+          // Orphaned item objects are simply never re-picked.
+          const queue = queueBySession.get(sessionID) ?? [];
+          if (queue.length === 0) break;
           if (pausedBySession.has(sessionID)) break;
           // Failed items are retried across drains (autoRetryOnIdle) but only
           // up to maxRetries total attempts; otherwise one permanently failing
@@ -675,7 +701,7 @@ export const AutoQueuePlugin = {
     }
     }
 
-  const remaining = queue.filter((item) => item.status !== "sent");
+  const remaining = (queueBySession.get(sessionID) ?? []).filter((item) => item.status !== "sent");
   queueBySession.set(sessionID, remaining);
 
   if (showedEmptyToast) {
@@ -741,6 +767,9 @@ export const AutoQueuePlugin = {
       },
       async execute({ action, index, to, text }: { action?: string; index?: number; to?: number; text?: string }, ctx: any) {
         const nextAction = action ?? "status";
+        // Any tool action may mutate this session's queue state; mark dirty so
+        // a concurrent reloadFromDisk cannot overwrite it with stale disk data.
+        dirtySessions.add(ctx.sessionID);
         const queue = queueBySession.get(ctx.sessionID) ?? [];
         const pendingCount = getPendingCount(queue);
         const busy = isBusy(ctx.sessionID);
@@ -821,13 +850,16 @@ export const AutoQueuePlugin = {
           const cleared = queue.length;
           queueBySession.set(ctx.sessionID, []);
           schedulePersist();
-          try { await showToast(ctx.sessionID, true); } catch { /* noop */ }
+          // No forced toast: the tool result reports the clear. The old
+          // "Queue empty. All queued messages sent." here was a false success
+          // signal — cleared items were discarded, not sent (mirrors the
+          // slash-path fix in 676ed28).
           return `Cleared ${cleared} messages from queue`;
         }
 
         if (nextAction === "drop") {
           const idx = (index ?? 1) - 1;
-          if (idx < 0 || idx >= queue.length) return `Invalid index. Queue has ${queue.length} items.`;
+          if (idx < 0 || idx >= queue.length) return outOfRangeMsg(queue);
           const dropped = queue.splice(idx, 1)[0];
           schedulePersist();
           try { await showToast(ctx.sessionID); } catch { /* noop */ }
@@ -987,6 +1019,12 @@ export const AutoQueuePlugin = {
       rm: "delete",
     };
 
+    // Sentinel returned by handleSlashCommand when the command was already
+    // executed <2s ago through the other hook. Callers must ack silently
+    // (replace parts, NO toast) — the first execution already toasted.
+    const COMMAND_DUP_RESULT = "\u0000auto-queue-dup";
+    let lastCommandRun: { key: string; ts: number } | null = null;
+
     function normalizeCommandName(cmd: string): string {
       let name = cmd.replace(/^\//, "").toLowerCase();
       if (name.startsWith("queue-")) name = name.slice("queue-".length);
@@ -1006,6 +1044,22 @@ export const AutoQueuePlugin = {
         args = trimmed.slice(first.length).trim();
       }
       if (!VALID_SLASH_COMMANDS.includes(normalized)) return null;
+
+      // Single-flight guard (review F1): the same logical command reaches the
+      // plugin through TWO hooks — command.execute.before (registered command)
+      // and chat.message (raw text AND the queue.md template expansion, which
+      // discards the before-hook's replaced parts). Without dedup every
+      // /queue <action> executed twice: append queued two items, delete
+      // destroyed the WRONG second item, clear produced conflicting toasts.
+      // The 2s window only catches near-simultaneous hook deliveries; a human
+      // re-running the same command lands outside it.
+      const cmdKey = `${sessionID}|${normalized}|${args}`;
+      if (lastCommandRun && lastCommandRun.key === cmdKey && Date.now() - lastCommandRun.ts < 2000) {
+        return COMMAND_DUP_RESULT;
+      }
+      lastCommandRun = { key: cmdKey, ts: Date.now() };
+      // Any executed action may mutate queue state — dirty for reload safety.
+      dirtySessions.add(sessionID);
 
       const queue = queueBySession.get(sessionID) ?? [];
       const pendingCount = getPendingCount(queue);
@@ -1215,7 +1269,9 @@ export const AutoQueuePlugin = {
         // the hidden ack part in the message (see makeCommandAckPart). The
         // command text/result must never reach the model — otherwise the model
         // re-executes the action via the queue tool (double execution).
-        void showResultToast(result);
+        // DUP: the chat.message hook re-delivered an already-executed command
+        // — ack silently, the first execution already toasted.
+        if (result !== COMMAND_DUP_RESULT) void showResultToast(result);
         output.parts = [makeCommandAckPart()];
       },
 
@@ -1261,7 +1317,7 @@ export const AutoQueuePlugin = {
         if (result !== null) {
           // Same contract as command.execute.before: result goes to a toast
           // only; the stored message keeps just the hidden ack part.
-          void showResultToast(result);
+          if (result !== COMMAND_DUP_RESULT) void showResultToast(result);
           output.parts.length = 0;
           output.parts.push(makeCommandAckPart());
           return;
@@ -1277,7 +1333,8 @@ export const AutoQueuePlugin = {
         const rawArgs = templateMatch[1].replace(/\.\s*$/, "").trim();
         const result = handleSlashCommand("queue", rawArgs, input.sessionID);
         if (result !== null) {
-          void showResultToast(result);
+          // DUP: the before-hook already executed this command — ack silently.
+          if (result !== COMMAND_DUP_RESULT) void showResultToast(result);
           output.parts.length = 0;
           output.parts.push(makeCommandAckPart());
           return;
@@ -1293,7 +1350,11 @@ export const AutoQueuePlugin = {
     const allSystemReminders = textParts.every((p: any) =>
       typeof p.text === "string" && (p.text.startsWith("<system-reminder") || p.text.includes("Instructions from:"))
     );
-    if (allSystemReminders) return;
+    // A message with NO text parts at all must not take this early return:
+    // [].every() is true, which let attachment-only messages pass through raw
+    // into a busy session (accepted but no turn created = silent loss class,
+    // review F7).
+    if (textParts.length > 0 && allSystemReminders) return;
 
     const allSynthetic = parts.every((p: any) => p.synthetic || p.ignored || p.type !== "text");
     if (allSynthetic) return;
@@ -1305,6 +1366,7 @@ export const AutoQueuePlugin = {
     }
 
     const queue = getQueue(input.sessionID);
+    dirtySessions.add(input.sessionID);
     if (queue.length >= maxQueueSize) {
       try {
         await client.tui.showToast({
