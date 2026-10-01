@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import { watchFile, unwatchFile, existsSync, mkdirSync, statSync } from "node:fs";
-import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename, open, unlink, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
 interface AutoQueueOptions {
@@ -138,21 +138,86 @@ async function renameWithRetry(tmp: string, target: string): Promise<void> {
   }
 }
 
-async function saveState(filePath: string, state: PersistedState): Promise<void> {
-  const tmp = `${filePath}.tmp`;
+let saveTempSequence = 0;
+
+async function saveState(filePath: string, state: PersistedState, serialized?: string): Promise<void> {
+  const tmp = `${filePath}.${process.pid}.${Date.now()}.${++saveTempSequence}.tmp`;
   // Atomic write: a crash mid-write must never leave a truncated (unparseable)
   // queue file behind — that would silently discard the persisted queue.
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(tmp, JSON.stringify(state, null, 2), "utf-8");
-  // Let EPERM/EBUSY/ENOSPC propagate: persistState guards its dedup hash with
-  // this success. A swallowed failure here froze the file on disk while memory
-  // moved on — stale disk state resurrected sent items on restart (proven live).
-  await renameWithRetry(tmp, filePath);
+  try {
+    await writeFile(tmp, serialized ?? JSON.stringify(state, null, 2), "utf-8");
+    // Let EPERM/EBUSY/ENOSPC propagate: persistState guards its dedup hash with
+    // this success. A swallowed failure here froze the file on disk while memory
+    // moved on — stale disk state resurrected sent items on restart (proven live).
+    await renameWithRetry(tmp, filePath);
+  } catch (error) {
+    await unlink(tmp).catch(() => {});
+    throw error;
+  }
+}
+
+async function withFileLock<T>(filePath: string, action: () => Promise<T>, timeoutMs = 30_000): Promise<T> {
+  const lockPath = `${filePath}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  await mkdir(dirname(filePath), { recursive: true });
+
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  while (!handle) {
+    try {
+      handle = await open(lockPath, "wx");
+      await handle.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), "utf8");
+    } catch (error: any) {
+      if (handle) {
+        await handle.close().catch(() => {});
+        handle = null;
+        await unlink(lockPath).catch(() => {});
+      }
+      if (error?.code !== "EEXIST") throw error;
+
+      // Recover a lock left by a crashed process; never steal one from a live
+      // writer. Re-read before unlinking so a replaced lock owner is preserved.
+      try {
+        const ownerText = await readFile(lockPath, "utf8");
+        const owner = JSON.parse(ownerText);
+        let alive = false;
+        if (Number.isInteger(owner.pid) && owner.pid > 0) {
+          try { process.kill(owner.pid, 0); alive = true; }
+          catch (probeError: any) { alive = probeError?.code === "EPERM"; }
+        }
+        if (!alive) {
+          const currentText = await readFile(lockPath, "utf8");
+          if (currentText === ownerText) await unlink(lockPath).catch(() => {});
+          continue;
+        }
+      } catch (readError: any) {
+        if (readError?.code === "ENOENT") continue;
+        if (readError instanceof SyntaxError) {
+          const lockStat = await stat(lockPath).catch(() => null);
+          if (lockStat && Date.now() - lockStat.mtimeMs > timeoutMs) await unlink(lockPath).catch(() => {});
+          continue;
+        }
+      }
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for queue persistence lock: ${lockPath}`);
+      await sleep(25);
+    }
+  }
+
+  try {
+    return await action();
+  } finally {
+    await handle.close().catch(() => {});
+    try {
+      const owner = JSON.parse(await readFile(lockPath, "utf8"));
+      if (owner.token === token) await unlink(lockPath);
+    } catch { /* lock may have been reclaimed after process failure */ }
+  }
 }
 
 // Exported for behavior tests of the lock/retry mechanics (RULE #6: verify by
 // execution, not by reading).
-export const persistInternals = { sleep, renameWithRetry, saveState, loadState };
+export const persistInternals = { sleep, renameWithRetry, saveState, loadState, withFileLock };
 
 function makeTruncate(previewLength: number) {
   return function truncatePreview(text: string): string {
@@ -251,6 +316,8 @@ function getPendingCount(queue: QueuedItem[]): number {
 
 function isTransientError(error: any): boolean {
   if (!error) return true;
+  const status = error?.cause?.status ?? error?.response?.status;
+  if (typeof status === "number") return status === 408 || status === 425 || status === 429 || status >= 500;
   const msg = error instanceof Error ? error.message : String(error);
   const lower = msg.toLowerCase();
   return (
@@ -280,6 +347,15 @@ function isTransientError(error: any): boolean {
     lower.includes("reset") ||
     lower.includes("broken pipe")
   );
+}
+
+function promptResultError(result: any): Error | null {
+  if (!result?.error) return null;
+  const body = result.error;
+  const message = typeof body === "string"
+    ? body
+    : body?.data?.message ?? body?.message ?? body?.name ?? JSON.stringify(body);
+  return new Error(`Prompt rejected: ${message}`, { cause: { status: result.response?.status, body } });
 }
 
 function sleep(ms: number): Promise<void> {
@@ -362,51 +438,93 @@ export const AutoQueuePlugin = {
     const pausedBySession = new Set<string>();
     let persistTimer: ReturnType<typeof setTimeout> | null = null;
     let lastWrittenHash: string = "";
-    // Non-null while a debounced save is in flight. The reload path must await
-    // it: lastWrittenHash is assigned BEFORE the async write lands, so a
-    // reload that reads pre-save disk content would see a mismatched hash and
-    // apply stale state over newer in-memory data (proven by repro).
+    // Track active save for watcher coordination; lock-protected saves merge
+    // only mutated keys into latest disk state.
     let savePromise: Promise<void> | null = null;
-    // Sessions with in-memory mutations not yet proven durable. reloadFromDisk
-    // must never replace these sessions' queues from disk: the disk content
-    // was loaded asynchronously and cannot contain mutations that landed
-    // during the load await (review F3 — silent message loss window).
-    const dirtySessions = new Set<string>();
+    let saveChain: Promise<void> = Promise.resolve();
+    let mutationRevision = 0;
+    let globalRevision = 0;
+    // Revisioned dirty tracking skips read-only operations and cannot clear a
+    // mutation newer than the snapshot that just finished saving.
+    const dirtySessions = new Map<string, number>();
+    const dirtyPausedSessions = new Map<string, number>();
+
+    function markSessionDirty(sessionID: string, pausedChanged = false) {
+      const revision = ++mutationRevision;
+      dirtySessions.set(sessionID, revision);
+      if (pausedChanged) dirtyPausedSessions.set(sessionID, revision);
+    }
 
     async function persistState() {
       if (!persistQueue) return;
-      const queues: Record<string, any[]> = {};
-      for (const [sessionID, queue] of queueBySession.entries()) {
-        const serializable = serializeQueue(queue);
-        if (serializable.length > 0) queues[sessionID] = serializable;
-      }
-      const state: PersistedState = {
-        version: 1,
-        mode: currentMode,
-        queues,
-        pausedSessions: [...pausedBySession],
-      };
-      const json = JSON.stringify(state, null, 2);
-      const hash = Bun.hash(json).toString();
-      if (hash === lastWrittenHash) return;
-      const save = saveState(resolvedPersistPath, state)
-        .then(() => {
-          // Pin the dedup hash ONLY after a successful write: if the save
-          // fails (EPERM lock, disk full, ...), leaving the hash unpinned
-          // lets the next persist retry the same state instead of
-          // dedup-skipping it forever (disk frozen, memory moved on → stale
-          // queue resurrected on restart — proven live).
-          lastWrittenHash = hash;
-        })
-        .finally(() => {
-          if (savePromise === save) savePromise = null;
-        });
+      const save = saveChain.then(() => withFileLock(resolvedPersistPath, async () => {
+        const queueRevisions = new Map(dirtySessions);
+        const pausedRevisions = new Map(dirtyPausedSessions);
+        const savedGlobalRevision = globalRevision;
+        if (queueRevisions.size === 0 && pausedRevisions.size === 0 && savedGlobalRevision === 0) return;
+
+        const diskState = await loadState(resolvedPersistPath) ?? {
+          version: 1, mode: currentMode, queues: {}, pausedSessions: [],
+        };
+        const queues = { ...(diskState.queues ?? {}) };
+        for (const sessionID of queueRevisions.keys()) {
+          const serializable = serializeQueue(queueBySession.get(sessionID) ?? []);
+          if (serializable.length > 0) queues[sessionID] = serializable;
+          else delete queues[sessionID];
+        }
+        const paused = new Set(diskState.pausedSessions ?? []);
+        for (const sessionID of pausedRevisions.keys()) {
+          if (pausedBySession.has(sessionID)) paused.add(sessionID);
+          else paused.delete(sessionID);
+        }
+        const state: PersistedState = {
+          version: 1,
+          mode: savedGlobalRevision !== 0 ? currentMode : diskState.mode ?? currentMode,
+          queues,
+          pausedSessions: [...paused],
+        };
+        const json = JSON.stringify(state, null, 2);
+        const hash = Bun.hash(json).toString();
+        const diskHash = Bun.hash(JSON.stringify(diskState, null, 2)).toString();
+        if (hash !== diskHash) await saveState(resolvedPersistPath, state, json);
+        const protectedQueues = new Set([...dirtySessions.keys(), ...draining]);
+        const savedSessionIDs = new Set(Object.keys(queues));
+        for (const sessionID of [...queueBySession.keys()]) {
+          if (!protectedQueues.has(sessionID) && !savedSessionIDs.has(sessionID)) queueBySession.delete(sessionID);
+        }
+        for (const [sessionID, items] of Object.entries(queues)) {
+          if (protectedQueues.has(sessionID)) continue;
+          const queue = deserializeQueue(items);
+          if (queue.length > 0) queueBySession.set(sessionID, queue);
+          else queueBySession.delete(sessionID);
+        }
+        for (const sessionID of pausedBySession) {
+          if (!dirtyPausedSessions.has(sessionID) && !paused.has(sessionID)) pausedBySession.delete(sessionID);
+        }
+        for (const sessionID of paused) {
+          if (!dirtyPausedSessions.has(sessionID)) pausedBySession.add(sessionID);
+        }
+        // Pin only state observed on disk or successfully written.
+        lastWrittenHash = hash;
+        for (const [sessionID, revision] of queueRevisions) {
+          if (dirtySessions.get(sessionID) === revision) dirtySessions.delete(sessionID);
+        }
+        for (const [sessionID, revision] of pausedRevisions) {
+          if (dirtyPausedSessions.get(sessionID) === revision) dirtyPausedSessions.delete(sessionID);
+        }
+        if (globalRevision === savedGlobalRevision) globalRevision = 0;
+      })).finally(() => {
+        if (savePromise === save) savePromise = null;
+      });
+      saveChain = save.catch(() => {});
       savePromise = save;
       await save;
     }
 
-    function schedulePersist() {
+    function schedulePersist(sessionID?: string, pausedChanged = false, globalChanged = false) {
       if (!persistQueue) return;
+      if (sessionID !== undefined) markSessionDirty(sessionID, pausedChanged);
+      else if (globalChanged) globalRevision = ++mutationRevision;
       if (persistTimer) clearTimeout(persistTimer);
       persistTimer = setTimeout(() => {
         persistTimer = null;
@@ -418,6 +536,7 @@ export const AutoQueuePlugin = {
       if (!persistQueue) return;
       const state = await loadState(resolvedPersistPath);
       if (!state) return;
+      lastWrittenHash = Bun.hash(JSON.stringify(state, null, 2)).toString();
       // Mode is runtime-only: the configured default wins on startup. A stale
       // persisted "hold" must not disable auto-drain after an upgrade.
       if (state.pausedSessions) {
@@ -432,53 +551,34 @@ export const AutoQueuePlugin = {
     }
 
     async function reloadFromDisk() {
-      // Flush unsaved in-memory changes BEFORE reading disk, so an external
-      // file change (or our own write echo) cannot revert state that has not
-      // been persisted yet.
-      if (persistTimer) {
-        clearTimeout(persistTimer);
-        persistTimer = null;
-        await persistState();
-      }
-      // A debounced save may be mid-flight (timer already fired): wait for it
-      // so loadState reads post-save content, never the stale pre-save file.
+      // Never race a local snapshot write. Any mutation arriving during this
+      // await is protected by revisioned dirty tracking below.
       if (savePromise) await savePromise;
       const state = await loadState(resolvedPersistPath);
       if (!state) return;
-      // Our own write echo: in-memory state is already authoritative.
       const hash = Bun.hash(JSON.stringify(state, null, 2)).toString();
       if (hash === lastWrittenHash) return;
-      // Mode is runtime-only (see restoreState).
-      pausedBySession.clear();
-      if (state.pausedSessions) {
-        for (const s of state.pausedSessions) pausedBySession.add(s);
-      }
-      // Never replace the queue of a session whose drain is in flight: drain
-      // holds a live reference and writes authoritative state when it finishes.
-      // Same for DIRTY sessions: their in-memory state contains mutations that
-      // may be younger than the file we just read (review F3).
+
+      const protectedQueues = new Set([...dirtySessions.keys(), ...draining]);
+      const diskSessionIDs = new Set(Object.keys(state.queues ?? {}));
       for (const sid of [...queueBySession.keys()]) {
-        if (!draining.has(sid) && !dirtySessions.has(sid)) queueBySession.delete(sid);
+        if (!protectedQueues.has(sid) && !diskSessionIDs.has(sid)) queueBySession.delete(sid);
       }
-      if (state.queues) {
-        for (const [sessionID, items] of Object.entries(state.queues)) {
-          if (draining.has(sessionID) || dirtySessions.has(sessionID)) continue;
-          const queue = deserializeQueue(items);
-          if (queue.length > 0) queueBySession.set(sessionID, queue);
-        }
+      for (const [sessionID, items] of Object.entries(state.queues ?? {})) {
+        if (protectedQueues.has(sessionID)) continue;
+        const queue = deserializeQueue(items);
+        if (queue.length > 0) queueBySession.set(sessionID, queue);
+        else queueBySession.delete(sessionID);
       }
-      // Reconciled: in-memory state is authoritative for every session. A
-      // dirty-skipped session's memory is younger than the file we just read,
-      // so persist immediately — otherwise memory and disk stay divergent
-      // until some unrelated mutation happens (crash before that = loss).
-      dirtySessions.clear();
-      // Re-pin the echo-suppression hash to the content we just loaded.
-      // Without this, the convergence persist below can be dedup-SKIPPED:
-      // memory state may hash equal to lastWrittenHash (our own earlier
-      // write) while the FILE holds different (external) content — the write
-      // never happens and the divergence becomes permanent.
+      if (dirtyPausedSessions.size === 0) {
+        pausedBySession.clear();
+        for (const sessionID of state.pausedSessions ?? []) pausedBySession.add(sessionID);
+      }
+
+      // Re-pin to the external content observed. Locally dirty sessions are
+      // persisted through the lock-protected merge, never a stale full snapshot.
       lastWrittenHash = Bun.hash(JSON.stringify(state, null, 2)).toString();
-      schedulePersist();
+      if (dirtySessions.size > 0 || dirtyPausedSessions.size > 0 || globalRevision !== 0) schedulePersist();
       // No toast here: a disk reload is not a user-visible queue event. The
       // old forced empty-toast fired "Queue empty. All queued messages sent."
       // on EVERY watcher reload — a false success signal (proven live).
@@ -520,6 +620,14 @@ export const AutoQueuePlugin = {
       const next: QueuedItem[] = [];
       queueBySession.set(sessionID, next);
       return next;
+    }
+
+    function hasQueueCapacity(queue: QueuedItem[], additional = 1): boolean {
+      return getPendingCount(queue) + additional <= maxQueueSize;
+    }
+
+    function queueFullMessage(): string {
+      return `Queue full (${maxQueueSize} max). Remove or send queued items first.`;
     }
 
     async function showToast(sessionID: string, forceEmpty = false) {
@@ -587,7 +695,7 @@ export const AutoQueuePlugin = {
       const initialQueue = queueBySession.get(sessionID) ?? [];
       if (initialQueue.length === 0) return;
       draining.add(sessionID);
-      dirtySessions.add(sessionID);
+      markSessionDirty(sessionID);
       try {
         if (drainDelayMs > 0) await sleep(drainDelayMs);
         let showedEmptyToast = false;
@@ -614,7 +722,7 @@ export const AutoQueuePlugin = {
             break;
           }
           next.status = "sending";
-          schedulePersist();
+          schedulePersist(sessionID);
           try {
             await showToast(sessionID);
           } catch { /* TUI may not be active */ }
@@ -630,7 +738,7 @@ export const AutoQueuePlugin = {
           while (!sent && attempts < maxAttempts) {
             attempts++;
             try {
-              await client.session.prompt({
+              const result = await client.session.prompt({
                 path: { id: sessionID },
                 body: {
                   agent: next.agent,
@@ -639,7 +747,10 @@ export const AutoQueuePlugin = {
                   tools: next.tools,
                   parts: markInternalParts(next.parts),
                 },
+                throwOnError: true,
               });
+              const resultError = promptResultError(result);
+              if (resultError) throw resultError;
         next.status = "sent";
         next.lastError = undefined;
         sent = true;
@@ -709,7 +820,7 @@ export const AutoQueuePlugin = {
         break;
       }
 
-    schedulePersist();
+    schedulePersist(sessionID);
     const pendingAfterSend = getPendingCount(queue);
     if (pendingAfterSend > 0) {
       try {
@@ -729,7 +840,7 @@ export const AutoQueuePlugin = {
       await showToast(sessionID, remaining.length === 0);
     } catch { /* TUI may not be active */ }
   }
-  schedulePersist();
+  schedulePersist(sessionID);
       } finally {
         draining.delete(sessionID);
       }
@@ -786,9 +897,6 @@ export const AutoQueuePlugin = {
       },
       async execute({ action, index, to, text }: { action?: string; index?: number; to?: number; text?: string }, ctx: any) {
         const nextAction = action ?? "status";
-        // Any tool action may mutate this session's queue state; mark dirty so
-        // a concurrent reloadFromDisk cannot overwrite it with stale disk data.
-        dirtySessions.add(ctx.sessionID);
         const queue = queueBySession.get(ctx.sessionID) ?? [];
         const pendingCount = getPendingCount(queue);
         const busy = isBusy(ctx.sessionID);
@@ -853,14 +961,14 @@ export const AutoQueuePlugin = {
     if (nextAction === "hold") {
       if (currentMode === "hold") return `Mode: hold`;
       currentMode = "hold";
-      schedulePersist();
+      schedulePersist(undefined, false, true);
       return `Mode: hold (queued messages held until manually drained)`;
     }
 
     if (nextAction === "immediate") {
       if (currentMode === "immediate") return `Mode: immediate`;
       currentMode = "immediate";
-      schedulePersist();
+      schedulePersist(undefined, false, true);
       await drain(ctx.sessionID);
       return `Mode: immediate (queued messages drain automatically on idle)`;
     }
@@ -868,7 +976,7 @@ export const AutoQueuePlugin = {
         if (nextAction === "clear") {
           const cleared = queue.length;
           queueBySession.set(ctx.sessionID, []);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           // No forced toast: the tool result reports the clear. The old
           // "Queue empty. All queued messages sent." here was a false success
           // signal — cleared items were discarded, not sent (mirrors the
@@ -880,7 +988,7 @@ export const AutoQueuePlugin = {
           const idx = (index ?? 1) - 1;
           if (idx < 0 || idx >= queue.length) return outOfRangeMsg(queue);
           const dropped = queue.splice(idx, 1)[0];
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           try { await showToast(ctx.sessionID); } catch { /* noop */ }
           return `Dropped: ${dropped.preview}`;
         }
@@ -893,7 +1001,7 @@ export const AutoQueuePlugin = {
             item.retries = 0;
             item.lastError = undefined;
           }
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           try { await showToast(ctx.sessionID); } catch { /* noop */ }
           if (!paused) await drain(ctx.sessionID);
           return `Retrying ${failedItems.length} failed messages`;
@@ -901,13 +1009,13 @@ export const AutoQueuePlugin = {
 
         if (nextAction === "pause") {
           pausedBySession.add(ctx.sessionID);
-          schedulePersist();
+          schedulePersist(ctx.sessionID, true);
           return "Queue paused.";
         }
 
         if (nextAction === "resume") {
           pausedBySession.delete(ctx.sessionID);
-          schedulePersist();
+          schedulePersist(ctx.sessionID, true);
           await drain(ctx.sessionID);
           return "Queue resumed. Draining pending messages.";
         }
@@ -920,36 +1028,39 @@ export const AutoQueuePlugin = {
           const [item] = queue.splice(from - 1, 1);
           queue.splice(target - 1, 0, item);
           queueBySession.set(ctx.sessionID, queue);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           return `Moved item ${from} to position ${target}`;
         }
 
         if (nextAction === "insert") {
           const idx = index ?? 1;
           if (!text) return "No text provided.";
+          if (!hasQueueCapacity(queue)) return queueFullMessage();
           if (idx < 1 || idx > queue.length + 1) return outOfRangeMsg(queue);
           const item = makeTextItem(ctx.sessionID, text);
           queue.splice(idx - 1, 0, item);
           queueBySession.set(ctx.sessionID, queue);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           return `Inserted at position ${idx}: ${item.preview}`;
         }
 
         if (nextAction === "append") {
           if (!text) return "No text provided.";
+          if (!hasQueueCapacity(queue)) return queueFullMessage();
           const item = makeTextItem(ctx.sessionID, text);
           queue.push(item);
           queueBySession.set(ctx.sessionID, queue);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           return `Appended: ${item.preview}`;
         }
 
         if (nextAction === "prepend") {
           if (!text) return "No text provided.";
+          if (!hasQueueCapacity(queue)) return queueFullMessage();
           const item = makeTextItem(ctx.sessionID, text);
           queue.unshift(item);
           queueBySession.set(ctx.sessionID, queue);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           try { await showToast(ctx.sessionID); } catch { /* noop */ }
           return `Prepended: ${item.preview}`;
         }
@@ -959,7 +1070,7 @@ export const AutoQueuePlugin = {
           if (idx < 1 || idx > queue.length) return outOfRangeMsg(queue);
           const dropped = queue.splice(idx - 1, 1)[0];
           queueBySession.set(ctx.sessionID, queue);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           try { await showToast(ctx.sessionID); } catch { /* noop */ }
           return `Deleted: ${dropped.preview}`;
         }
@@ -971,21 +1082,21 @@ export const AutoQueuePlugin = {
           const item = makeTextItem(ctx.sessionID, text);
           queue[idx - 1] = item;
           queueBySession.set(ctx.sessionID, queue);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           return `Set position ${idx}: ${item.preview}`;
         }
 
         if (nextAction === "sort") {
           queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
           queueBySession.set(ctx.sessionID, queue);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           return `Sorted ${queue.length} items by time (oldest first)`;
         }
 
         if (nextAction === "invert") {
           queue.reverse();
           queueBySession.set(ctx.sessionID, queue);
-          schedulePersist();
+          schedulePersist(ctx.sessionID);
           return `Reversed ${queue.length} items`;
         }
 
@@ -1077,9 +1188,6 @@ export const AutoQueuePlugin = {
         return COMMAND_DUP_RESULT;
       }
       lastCommandRun = { key: cmdKey, ts: Date.now() };
-      // Any executed action may mutate queue state — dirty for reload safety.
-      dirtySessions.add(sessionID);
-
       const queue = queueBySession.get(sessionID) ?? [];
       const pendingCount = getPendingCount(queue);
       const busy = isBusy(sessionID);
@@ -1090,13 +1198,13 @@ export const AutoQueuePlugin = {
     case "hold": {
       if (currentMode === "hold") return `Queue mode: hold (already active)`;
       currentMode = "hold";
-      schedulePersist();
+      schedulePersist(undefined, false, true);
       return `Queue mode: hold (queued messages held until manually drained)`;
     }
     case "immediate": {
       if (currentMode === "immediate") return `Queue mode: immediate (already active)`;
       currentMode = "immediate";
-      schedulePersist();
+      schedulePersist(undefined, false, true);
       drain(sessionID).catch(() => {});
       return `Queue mode: immediate (queued messages drain automatically on idle)`;
     }
@@ -1133,7 +1241,7 @@ export const AutoQueuePlugin = {
         case "clear": {
           const cleared = queue.length;
           queueBySession.set(sessionID, []);
-          schedulePersist();
+          schedulePersist(sessionID);
           // No toast here: the command result toast reports the clear. The old
           // forced "Queue empty. All queued messages sent." here was a false
           // success signal — cleared items were discarded, not sent.
@@ -1141,12 +1249,12 @@ export const AutoQueuePlugin = {
         }
         case "pause": {
           pausedBySession.add(sessionID);
-          schedulePersist();
+          schedulePersist(sessionID, true);
           return "Queue paused.";
         }
         case "resume": {
           pausedBySession.delete(sessionID);
-          schedulePersist();
+          schedulePersist(sessionID, true);
           drain(sessionID).catch(() => {});
           return "Queue resumed. Draining pending messages.";
         }
@@ -1162,7 +1270,7 @@ export const AutoQueuePlugin = {
           const [item] = queue.splice(from - 1, 1);
           queue.splice(to - 1, 0, item);
           queueBySession.set(sessionID, queue);
-          schedulePersist();
+          schedulePersist(sessionID);
           return `Moved item ${from} to position ${to}`;
         }
         case "insert": {
@@ -1172,28 +1280,32 @@ export const AutoQueuePlugin = {
           const insertText = args.slice(firstSpace + 1).trim();
           if (!idx) return "Invalid index. Must be a positive number.";
           if (!insertText) return "No text provided.";
+          if (!hasQueueCapacity(queue)) return queueFullMessage();
           if (idx > queue.length + 1) return outOfRangeMsg(queue);
           const item = makeTextItem(sessionID, insertText);
           queue.splice(idx - 1, 0, item);
           queueBySession.set(sessionID, queue);
-          schedulePersist();
+          schedulePersist(sessionID);
           return `Inserted at position ${idx}: ${item.preview}`;
         }
         case "append": {
           const appendText = args.trim();
           if (!appendText) return "Usage: /append <text>";
+          if (!hasQueueCapacity(queue)) return queueFullMessage();
           const item = makeTextItem(sessionID, appendText);
           queue.push(item);
           queueBySession.set(sessionID, queue);
-          schedulePersist();
+          schedulePersist(sessionID);
           return `Appended: ${item.preview}`;
         }
         case "prepend": {
           const prependText = args.trim();
           if (!prependText) return "Usage: /prepend <text>";
+          if (!hasQueueCapacity(queue)) return queueFullMessage();
           const item = makeTextItem(sessionID, prependText);
           queue.unshift(item);
           queueBySession.set(sessionID, queue);
+          schedulePersist(sessionID);
           showToast(sessionID).catch(() => {});
           return `Prepended: ${item.preview}`;
         }
@@ -1203,7 +1315,7 @@ export const AutoQueuePlugin = {
           if (idx < 1 || idx > queue.length) return outOfRangeMsg(queue);
           const dropped = queue.splice(idx - 1, 1)[0];
           queueBySession.set(sessionID, queue);
-          schedulePersist();
+          schedulePersist(sessionID);
           showToast(sessionID).catch(() => {});
           return `Deleted: ${dropped.preview}`;
         }
@@ -1218,19 +1330,19 @@ export const AutoQueuePlugin = {
           const item = makeTextItem(sessionID, setText);
           queue[idx - 1] = item;
           queueBySession.set(sessionID, queue);
-          schedulePersist();
+          schedulePersist(sessionID);
           return `Set position ${idx}: ${item.preview}`;
         }
         case "sort": {
           queue.sort((a, b) => a.enqueuedAt - b.enqueuedAt);
           queueBySession.set(sessionID, queue);
-          schedulePersist();
+          schedulePersist(sessionID);
           return `Sorted ${queue.length} items by time (oldest first)`;
         }
         case "invert": {
           queue.reverse();
           queueBySession.set(sessionID, queue);
-          schedulePersist();
+          schedulePersist(sessionID);
           return `Reversed ${queue.length} items`;
         }
         case "get": {
@@ -1385,13 +1497,12 @@ export const AutoQueuePlugin = {
     }
 
     const queue = getQueue(input.sessionID);
-    dirtySessions.add(input.sessionID);
-    if (queue.length >= maxQueueSize) {
+    if (!hasQueueCapacity(queue)) {
       try {
         await client.tui.showToast({
           body: {
             title: "Message Queue",
-            message: `Queue full (${maxQueueSize} max). Message dropped.`,
+            message: queueFullMessage() + " Incoming message dropped.",
             variant: "error",
             duration: emptyToastDurationMs * 3,
           },
@@ -1434,7 +1545,7 @@ export const AutoQueuePlugin = {
     // A newly queued message means the user cares again: un-hide the pinned
     // toast (it also refreshes via showToast below).
     toastHiddenBySession.delete(input.sessionID);
-    schedulePersist();
+    schedulePersist(input.sessionID);
     try {
       await showToast(input.sessionID);
     } catch { /* TUI may not be active */ }
