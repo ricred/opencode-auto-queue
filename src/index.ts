@@ -409,9 +409,10 @@ export const AutoQueuePlugin = {
           if (queue.length > 0) queueBySession.set(sessionID, queue);
         }
       }
-      try {
-        await showToast("external", true);
-      } catch { /* noop */ }
+      // No toast here: a disk reload is not a user-visible queue event. The
+      // old forced empty-toast fired "Queue empty. All queued messages sent."
+      // on EVERY watcher reload — a false success signal (proven live).
+      void 0;
     }
 
     let watchTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1147,6 +1148,21 @@ export const AutoQueuePlugin = {
         const cmdName = trimmed.replace(/^\//, "").split(/\s+/)[0];
         const cmdArgs = trimmed.replace(/^\//, "").slice(cmdName.length).trim();
         const result = handleSlashCommand(cmdName, cmdArgs, input.sessionID);
+        if (result !== null) {
+          output.parts.length = 0;
+          output.parts.push(...markInternalParts([{ type: "text", text: result }]));
+          return;
+        }
+      }
+      // Command-FILE expansion: OpenCode expands /queue <action> (from
+      // queue.md) into the template text BEFORE this hook runs, so the
+      // startsWith("/queue") check above never matches and the expanded
+      // prompt gets enqueued as a literal message while busy. Intercept the
+      // template signature and run the action in the plugin instead.
+      const templateMatch = firstText.text.match(/^Use the queue tool with action:\s*(.+)$/im);
+      if (templateMatch) {
+        const rawArgs = templateMatch[1].replace(/\.\s*$/, "").trim();
+        const result = handleSlashCommand("queue", rawArgs, input.sessionID);
         if (result !== null) {
           output.parts.length = 0;
           output.parts.push(...markInternalParts([{ type: "text", text: result }]));
