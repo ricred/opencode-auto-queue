@@ -278,6 +278,11 @@ export const AutoQueuePlugin = {
       toastDurationMs = 10_000,
       emptyToastDurationMs = 4_000,
       failedToastDurationMs = 60_000,
+      // OpenCode TUI toasts cannot be sticky or manually dismissed (v1.18.x:
+      // unconditional setTimeout, no dismiss handler, duration=0 rejected by
+      // schema). To keep the queue visible while items are pending, the queue
+      // toast is re-posted on this interval ("heartbeat"). 0 disables.
+      queueToastHeartbeatMs = 20_000,
       maxPreviews = 3,
       previewLength = 28,
       placeholderTemplate = "Queued; {count} pending",
@@ -455,6 +460,7 @@ export const AutoQueuePlugin = {
     async function showToast(sessionID: string, forceEmpty = false) {
       const queue = queueBySession.get(sessionID) ?? [];
       const pending = getPendingCount(queue);
+      syncHeartbeat(sessionID);
       if (queue.length === 0 && !forceEmpty) return;
       const isEmpty = pending === 0;
       const variant = isEmpty ? "success" : "info";
@@ -466,6 +472,30 @@ export const AutoQueuePlugin = {
         });
       } catch {
         // TUI may not be active
+      }
+    }
+
+    // Pinned queue toast: while a session has pending items, re-post the queue
+    // listing toast every queueToastHeartbeatMs so it stays on screen (the TUI
+    // has no sticky toast and no manual dismissal). Stops when the queue
+    // empties or the user runs /queue hide.
+    const heartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
+    const toastHiddenBySession = new Set<string>();
+
+    function syncHeartbeat(sessionID: string) {
+      if (queueToastHeartbeatMs <= 0) return;
+      const queue = queueBySession.get(sessionID);
+      const want = !!queue && queue.length > 0 && !toastHiddenBySession.has(sessionID);
+      const has = heartbeatTimers.has(sessionID);
+      if (want && !has) {
+        const t = setInterval(() => {
+          void showToast(sessionID);
+        }, queueToastHeartbeatMs);
+        (t as any)?.unref?.();
+        heartbeatTimers.set(sessionID, t);
+      } else if (!want && has) {
+        clearInterval(heartbeatTimers.get(sessionID)!);
+        heartbeatTimers.delete(sessionID);
       }
     }
 
@@ -577,6 +607,10 @@ export const AutoQueuePlugin = {
         // the deferred attempt covers prompt-resolves-after-completion, where
         // no new idle event will fire — but only when an idle event was
         // observed AFTER this send (busy map alone can be stale).
+        // The one-send-per-pass break skips the post-send toast block below,
+        // so flag the empty state here — otherwise a fully drained queue never
+        // announces "Queue empty" (regression introduced with this pass logic).
+        if (getPendingCount(queue) === 0) showedEmptyToast = true;
         setTimeout(() => {
           if (
             !pausedBySession.has(sessionID) &&
@@ -627,6 +661,9 @@ export const AutoQueuePlugin = {
     }
 
     function makeTextItem(sessionID: string, text: string): QueuedItem {
+      // Any enqueue (tool or slash command) is a queue change: re-show the
+      // pinned toast if the user hid it.
+      toastHiddenBySession.delete(sessionID);
       const truncate = makeTruncate(previewLength);
       const extract = makeExtractPreview(truncate);
       const parts = [{ type: "text", text }];
@@ -642,10 +679,10 @@ export const AutoQueuePlugin = {
 
     const queueTool = tool({
       description:
-        "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get. Both modes queue messages while session is busy; hold = queued messages held until manual drain, immediate = queued messages auto-drain on idle. Only switch modes when explicitly requested.",
+        "Control message queue. Actions: hold, immediate, status, clear, drop, peek, retry, pause, resume, count, config, reorder, insert, append, prepend, delete, set, sort, invert, get, hide. Both modes queue messages while session is busy; hold = queued messages held until manual drain, immediate = queued messages auto-drain on idle. Only switch modes when explicitly requested. hide = stop the pinned queue toast until the queue changes (the TUI cannot dismiss toasts by click).",
       args: {
         action: tool.schema
-          .enum(["hold", "immediate", "status", "clear", "drop", "peek", "retry", "pause", "resume", "count", "config", "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get"])
+          .enum(["hold", "immediate", "status", "clear", "drop", "peek", "retry", "pause", "resume", "count", "config", "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get", "hide"])
           .optional()
           .describe("Action to perform"),
         index: tool.schema
@@ -701,6 +738,7 @@ export const AutoQueuePlugin = {
             `  drainDelayMs: ${drainDelayMs}`,
             `  autoRetryOnIdle: ${autoRetryOnIdle}`,
             `  persistQueue: ${persistQueue}`,
+            `  queueToastHeartbeatMs: ${queueToastHeartbeatMs}`,
             `  persistPath: ${resolvedPersistPath}`,
             `  persistDebounceMs: ${persistDebounceMs}`,
             `  previewLength: ${previewLength}`,
@@ -882,6 +920,7 @@ export const AutoQueuePlugin = {
     const VALID_SLASH_COMMANDS = [
       "hold", "immediate", "status", "clear", "pause", "resume", "count",
       "reorder", "insert", "append", "prepend", "delete", "set", "sort", "invert", "get",
+      "hide",
     ];
 
     function parseIndex(arg: string): number | null {
@@ -937,6 +976,10 @@ export const AutoQueuePlugin = {
       return `Queue mode: immediate (queued messages drain automatically on idle)`;
     }
         case "status": {
+          // Explicitly asking for the queue listing also re-enables the
+          // pinned toast (the user wants to see the queue).
+          toastHiddenBySession.delete(sessionID);
+          syncHeartbeat(sessionID);
           const lines = [
             `Mode: ${currentMode}`,
             `Session busy: ${busy}`,
@@ -952,6 +995,15 @@ export const AutoQueuePlugin = {
             });
           }
           return lines.join("\n");
+        }
+        case "hide": {
+          // The TUI toast cannot be dismissed by click (no handler exists in
+          // the TUI), so this command is the manual "close" for the pinned
+          // queue toast. It stays hidden until the queue changes or the user
+          // runs /queue status.
+          toastHiddenBySession.add(sessionID);
+          syncHeartbeat(sessionID);
+          return "Queue toast hidden. It will reappear when the queue changes (/queue status to show it again).";
         }
         case "clear": {
           const cleared = queue.length;
@@ -1235,6 +1287,9 @@ export const AutoQueuePlugin = {
       output.parts.push(placeholder);
     }
 
+    // A newly queued message means the user cares again: un-hide the pinned
+    // toast (it also refreshes via showToast below).
+    toastHiddenBySession.delete(input.sessionID);
     schedulePersist();
     try {
       await showToast(input.sessionID);

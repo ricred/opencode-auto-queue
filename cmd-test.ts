@@ -71,6 +71,65 @@ await new Promise((r) => setTimeout(r, 500));
 check("real drain delivered queued item", prompts.length === 1, `prompts=${prompts.length}`);
 
 rmSync(repo, { recursive: true, force: true });
+
+// ── Pinned queue toast (heartbeat) ──
+// Fresh plugin instance with a fast heartbeat so timers are testable.
+const repo2 = join(tmpdir(), "aq-hb-" + Date.now());
+mkdirSync(join(repo2, ".git"), { recursive: true });
+const toasts2: any[] = [];
+const client2 = {
+  tui: { showToast: async (c: any) => { toasts2.push(c.body); } },
+  session: { prompt: async () => {} },
+  app: { info: async () => ({}) },
+};
+const hooks2 = await factory.server({ client: client2, directory: repo2, worktree: repo2 } as any, { queueToastHeartbeatMs: 50 });
+const h2 = typeof hooks2 === "function" ? await hooks2({ client: client2 } as any) : hooks2;
+
+await h2["chat.message"](
+  { sessionID: "s2", agent: "build", messageID: "n0", model: { providerID: "p", modelID: "m" } },
+  { parts: [{ type: "text", text: "hb busy-maker" }], ...mockOut() },
+);
+await h2["chat.message"](
+  { sessionID: "s2", agent: "build", messageID: "n0b", model: { providerID: "p", modelID: "m" } },
+  { parts: [{ type: "text", text: "hb task" }], ...mockOut() },
+);
+const afterEnqueue = toasts2.filter((t) => t.message?.startsWith("Queue (")).length;
+await new Promise((r) => setTimeout(r, 170));
+const pinnedCount = toasts2.filter((t) => t.message?.startsWith("Queue (")).length;
+check("heartbeat re-posts queue toast while pending", pinnedCount >= afterEnqueue + 2, `posts=${pinnedCount} (enqueue=${afterEnqueue})`);
+
+// /queue hide = the manual "close" (TUI has no toast dismissal)
+await h2["chat.message"](
+  { sessionID: "s2", agent: "build", messageID: "n1" },
+  { parts: [{ type: "text", text: "/queue hide" }], ...mockOut() },
+);
+const afterHide = toasts2.filter((t) => t.message?.startsWith("Queue (")).length;
+await new Promise((r) => setTimeout(r, 170));
+const hiddenCount = toasts2.filter((t) => t.message?.startsWith("Queue (")).length;
+check("/queue hide stops the heartbeat", hiddenCount === afterHide, `before=${afterHide} after=${hiddenCount}`);
+
+// /queue status re-enables it
+await h2["chat.message"](
+  { sessionID: "s2", agent: "build", messageID: "n2" },
+  { parts: [{ type: "text", text: "/queue status" }], ...mockOut() },
+);
+const afterStatus = toasts2.filter((t) => t.message?.startsWith("Queue (")).length;
+await new Promise((r) => setTimeout(r, 170));
+const resumedCount = toasts2.filter((t) => t.message?.startsWith("Queue (")).length;
+check("/queue status re-enables heartbeat", resumedCount > afterStatus, `before=${afterStatus} after=${resumedCount}`);
+
+// drain to empty -> heartbeat must stop (no posts after the empty toast).
+// The drain path sleeps 1500ms before posting the empty toast — wait past it.
+await h2.event({ event: { type: "session.idle", properties: { sessionID: "s2" } } });
+await new Promise((r) => setTimeout(r, 2400));
+const finalCount = toasts2.filter((t) => t.message?.startsWith("Queue (")).length;
+const hasEmpty = toasts2.some((t) => t.message?.includes("All queued messages sent"));
+await new Promise((r) => setTimeout(r, 300));
+const stoppedCount = toasts2.filter((t) => t.message?.startsWith("Queue (")).length;
+check("drain to empty stops heartbeat", stoppedCount === finalCount && hasEmpty, `final=${finalCount} stopped=${stoppedCount} emptyToast=${hasEmpty}`);
+
+rmSync(repo2, { recursive: true, force: true });
+
 console.log(`\n${pass}/${pass + fail}`);
 process.exit(fail === 0 ? 0 : 1);
 
