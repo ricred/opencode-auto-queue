@@ -94,19 +94,44 @@ async function loadState(filePath: string): Promise<PersistedState | null> {
   }
 }
 
-async function saveState(filePath: string, state: PersistedState): Promise<void> {
-  try {
-    const dir = dirname(filePath);
-    await mkdir(dir, { recursive: true });
-    // Atomic write: a crash mid-write must never leave a truncated (unparseable)
-    // queue file behind — that would silently discard the persisted queue.
-    const tmp = `${filePath}.tmp`;
-    await writeFile(tmp, JSON.stringify(state, null, 2), "utf-8");
-    await rename(tmp, filePath);
-  } catch {
-    // persistence failure is non-fatal
+// Retry helper for Windows file locks: rename can hit EPERM/EBUSY while AV,
+// indexer or a concurrent reader holds the target open. Retrying with backoff
+// resolves virtually all transient lock collisions.
+async function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function renameWithRetry(tmp: string, target: string): Promise<void> {
+  // 8 attempts x 25ms*attempt backoff = ~700ms window: proven necessary — a
+  // 180ms external lock exhausts 5 attempts (~200ms) and still fails.
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      await rename(tmp, target);
+      return;
+    } catch (err: any) {
+      const code = err?.code ?? "";
+      if (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY") throw err;
+      if (attempt === 8) throw err;
+      await sleep(25 * attempt);
+    }
   }
 }
+
+async function saveState(filePath: string, state: PersistedState): Promise<void> {
+  const tmp = `${filePath}.tmp`;
+  // Atomic write: a crash mid-write must never leave a truncated (unparseable)
+  // queue file behind — that would silently discard the persisted queue.
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(tmp, JSON.stringify(state, null, 2), "utf-8");
+  // Let EPERM/EBUSY/ENOSPC propagate: persistState guards its dedup hash with
+  // this success. A swallowed failure here froze the file on disk while memory
+  // moved on — stale disk state resurrected sent items on restart (proven live).
+  await renameWithRetry(tmp, filePath);
+}
+
+// Exported for behavior tests of the lock/retry mechanics (RULE #6: verify by
+// execution, not by reading).
+export const persistInternals = { sleep, renameWithRetry, saveState, loadState };
 
 function makeTruncate(previewLength: number) {
   return function truncatePreview(text: string): string {
@@ -308,11 +333,20 @@ export const AutoQueuePlugin = {
       const json = JSON.stringify(state, null, 2);
       const hash = Bun.hash(json).toString();
       if (hash === lastWrittenHash) return;
-      lastWrittenHash = hash;
-      savePromise = saveState(resolvedPersistPath, state).finally(() => {
-        savePromise = null;
-      });
-      await savePromise;
+      const save = saveState(resolvedPersistPath, state)
+        .then(() => {
+          // Pin the dedup hash ONLY after a successful write: if the save
+          // fails (EPERM lock, disk full, ...), leaving the hash unpinned
+          // lets the next persist retry the same state instead of
+          // dedup-skipping it forever (disk frozen, memory moved on → stale
+          // queue resurrected on restart — proven live).
+          lastWrittenHash = hash;
+        })
+        .finally(() => {
+          if (savePromise === save) savePromise = null;
+        });
+      savePromise = save;
+      await save;
     }
 
     function schedulePersist() {
