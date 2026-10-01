@@ -865,7 +865,7 @@ export const AutoQueuePlugin = {
           const from = index ?? 1;
           const target = to ?? 1;
           if (from < 1 || from > queue.length || target < 1 || target > queue.length)
-            return `Index out of range. Queue has ${queue.length} items.`;
+            return outOfRangeMsg(queue);
           const [item] = queue.splice(from - 1, 1);
           queue.splice(target - 1, 0, item);
           queueBySession.set(ctx.sessionID, queue);
@@ -876,7 +876,7 @@ export const AutoQueuePlugin = {
         if (nextAction === "insert") {
           const idx = index ?? 1;
           if (!text) return "No text provided.";
-          if (idx < 1 || idx > queue.length + 1) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > queue.length + 1) return outOfRangeMsg(queue);
           const item = makeTextItem(ctx.sessionID, text);
           queue.splice(idx - 1, 0, item);
           queueBySession.set(ctx.sessionID, queue);
@@ -905,7 +905,7 @@ export const AutoQueuePlugin = {
 
         if (nextAction === "delete") {
           const idx = index ?? 1;
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > queue.length) return outOfRangeMsg(queue);
           const dropped = queue.splice(idx - 1, 1)[0];
           queueBySession.set(ctx.sessionID, queue);
           schedulePersist();
@@ -916,7 +916,7 @@ export const AutoQueuePlugin = {
         if (nextAction === "set") {
           const idx = index ?? 1;
           if (!text) return "No text provided.";
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > queue.length) return outOfRangeMsg(queue);
           const item = makeTextItem(ctx.sessionID, text);
           queue[idx - 1] = item;
           queueBySession.set(ctx.sessionID, queue);
@@ -940,7 +940,7 @@ export const AutoQueuePlugin = {
 
         if (nextAction === "get") {
           const idx = index ?? 1;
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > queue.length) return outOfRangeMsg(queue);
           const item = queue[idx - 1];
           const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
           const retry = item.retries > 0 ? `\nRetries: ${item.retries}` : "";
@@ -967,6 +967,17 @@ export const AutoQueuePlugin = {
     function parseIndex(arg: string): number | null {
       const n = parseInt(arg, 10);
       return Number.isFinite(n) && n > 0 ? n : null;
+    }
+
+    // Index errors must explain WHY the queue can be shorter than the user
+    // expects: in immediate mode the drain sends items on idle, so messages
+    // queued moments ago may already be gone (live-reported confusion:
+    // "added 3, rm 3 said out of range with 2 items" — one had drained).
+    function outOfRangeMsg(queue: { length: number }[]): string {
+      const base = `Index out of range. Queue has ${queue.length} items.`;
+      return currentMode === "immediate"
+        ? `${base} (Items may have been sent already — mode is immediate.)`
+        : base;
     }
 
     const COMMAND_ALIASES: Record<string, string> = {
@@ -1074,7 +1085,7 @@ export const AutoQueuePlugin = {
           const from = parseIndex(parts[0]);
           const to = parseIndex(parts[1]);
           if (!from || !to) return "Usage: /reorder <from> <to> (1-based indices)";
-          if (from > queue.length || to > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+          if (from > queue.length || to > queue.length) return outOfRangeMsg(queue);
           const [item] = queue.splice(from - 1, 1);
           queue.splice(to - 1, 0, item);
           queueBySession.set(sessionID, queue);
@@ -1088,7 +1099,7 @@ export const AutoQueuePlugin = {
           const insertText = args.slice(firstSpace + 1).trim();
           if (!idx) return "Invalid index. Must be a positive number.";
           if (!insertText) return "No text provided.";
-          if (idx > queue.length + 1) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx > queue.length + 1) return outOfRangeMsg(queue);
           const item = makeTextItem(sessionID, insertText);
           queue.splice(idx - 1, 0, item);
           queueBySession.set(sessionID, queue);
@@ -1116,7 +1127,7 @@ export const AutoQueuePlugin = {
         case "delete": {
           const idx = parseIndex(args.trim());
           if (!idx) return "Usage: /delete <index> (1-based)";
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > queue.length) return outOfRangeMsg(queue);
           const dropped = queue.splice(idx - 1, 1)[0];
           queueBySession.set(sessionID, queue);
           schedulePersist();
@@ -1130,7 +1141,7 @@ export const AutoQueuePlugin = {
           const setText = args.slice(firstSpace + 1).trim();
           if (!idx) return "Invalid index.";
           if (!setText) return "No text provided.";
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > queue.length) return outOfRangeMsg(queue);
           const item = makeTextItem(sessionID, setText);
           queue[idx - 1] = item;
           queueBySession.set(sessionID, queue);
@@ -1152,7 +1163,7 @@ export const AutoQueuePlugin = {
         case "get": {
           const idx = parseIndex(args.trim());
           if (!idx) return "Usage: /get <index> (1-based)";
-          if (idx < 1 || idx > queue.length) return `Index out of range. Queue has ${queue.length} items.`;
+          if (idx < 1 || idx > queue.length) return outOfRangeMsg(queue);
           const item = queue[idx - 1];
           const age = Math.round((Date.now() - item.enqueuedAt) / 1000);
           const retry = item.retries > 0 ? `\nRetries: ${item.retries}` : "";
