@@ -412,7 +412,6 @@ export const AutoQueuePlugin = {
       // No toast here: a disk reload is not a user-visible queue event. The
       // old forced empty-toast fired "Queue empty. All queued messages sent."
       // on EVERY watcher reload — a false success signal (proven live).
-      void 0;
     }
 
     let watchTimer: ReturnType<typeof setTimeout> | null = null;
