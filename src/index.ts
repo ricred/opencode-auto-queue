@@ -1,7 +1,7 @@
 import { tool } from "@opencode-ai/plugin";
-import { watchFile, unwatchFile, existsSync, mkdirSync } from "node:fs";
+import { watchFile, unwatchFile, existsSync, mkdirSync, statSync } from "node:fs";
 import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 interface AutoQueueOptions {
   toastDurationMs?: number;
@@ -93,6 +93,25 @@ async function loadState(filePath: string): Promise<PersistedState | null> {
     return parsed as PersistedState;
   } catch {
     return null;
+  }
+}
+
+async function defaultPersistPath(directory: string): Promise<string> {
+  const gitEntry = join(directory, ".git");
+  try {
+    const stat = statSync(gitEntry);
+    if (stat.isDirectory()) return join(gitEntry, "queue.json");
+
+    // Git worktrees use a .git *file* pointing at the real per-worktree gitdir.
+    // Writing <worktree>/.git/queue.json treats that file as a directory and
+    // fails ENOTDIR (persistence then silently stays memory-only).
+    const pointer = await readFile(gitEntry, "utf-8");
+    const match = pointer.match(/^gitdir:\s*(.+?)\s*$/m);
+    if (!match) throw new Error(`Invalid Git worktree pointer: ${gitEntry}`);
+    return join(resolve(directory, match[1]), "queue.json");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return join(gitEntry, "queue.json");
+    throw error;
   }
 }
 
@@ -330,7 +349,7 @@ export const AutoQueuePlugin = {
     const extractPreview = makeExtractPreview(truncatePreview);
     const buildToastMessage = makeBuildToastMessage(truncatePreview);
 
-    const resolvedPersistPath = persistPath || `${ctx.directory}/.git/queue.json`;
+    const resolvedPersistPath = persistPath || await defaultPersistPath(ctx.directory);
 
     let currentMode: string = defaultMode;
     const busyBySession = new Map<string, boolean>();

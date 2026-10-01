@@ -2,7 +2,7 @@
 // F1: slash command executed via BOTH hooks must run ONCE (single-flight).
 // F2: /queue clear during an in-flight drain must not resurrect cleared items.
 // F3: reloadFromDisk must not wipe sessions with un-persisted mutations.
-import { mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -124,6 +124,34 @@ const out = () => ({ parts: [{ type: "text", text: "placeholder" }] } as any);
   check("F3: enqueued item survives external reload", survived);
   check("F3: disk converged back to memory", readFileSync(persistPath, "utf8").includes("survivor"));
   rmSync(repo, { recursive: true, force: true });
+}
+
+// ---------- Worktree: .git pointer file resolves to real gitdir ----------
+{
+  const root = join(tmpdir(), "aq-worktree-" + Date.now());
+  const worktree = join(root, "project-worktree");
+  const gitdir = join(root, "main-repo", ".git", "worktrees", "project-worktree");
+  mkdirSync(worktree, { recursive: true });
+  mkdirSync(gitdir, { recursive: true });
+  writeFileSync(join(worktree, ".git"), `gitdir: ${gitdir}\n`, "utf8");
+
+  const mod = await import("./dist/index.js");
+  const factory = mod.AutoQueuePlugin ?? mod.default;
+  const client: any = {
+    tui: { showToast: async () => {} },
+    session: { prompt: async () => {} },
+    app: { info: async () => ({}) },
+  };
+  const hooks = await factory.server({ client, directory: worktree, worktree } as any, { persistDebounceMs: 30 });
+  await hooks.tool.queue.execute({ action: "append", text: "worktree-persisted" }, { sessionID: "s4" });
+  await sleep(150);
+
+  const realQueueFile = join(gitdir, "queue.json");
+  check("worktree: queue state written to resolved gitdir", existsSync(realQueueFile));
+  check("worktree: queue state survives (not written under .git file)",
+    existsSync(realQueueFile) && readFileSync(realQueueFile, "utf8").includes("worktree-persisted"));
+  check("worktree: no invalid .git/queue.json path", !existsSync(join(worktree, ".git", "queue.json")));
+  rmSync(root, { recursive: true, force: true });
 }
 
 console.log(`\n${pass + fail} checks, ${fail} failed`);
