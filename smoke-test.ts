@@ -65,12 +65,17 @@ function mkOut(text: string): any {
   await q.execute({ action: "append", text: "queued task B" }, { sessionID: "sC" });
   const outList: any = { parts: [{ type: "text", text: "placeholder" }] };
   await hooks["command.execute.before"]({ command: "queue", sessionID: "sC", arguments: "list" }, outList);
-  check("/queue list intercepted (alias -> status), shows 2 items",
-    outList.parts[0]?.metadata?.__auto_queue_internal === true && /Queued: 2/.test(outList.parts[0].text), outList.parts[0].text.split("\n")[3]);
+  check("/queue list intercepted (alias -> status), hidden ack + result toast",
+    outList.parts.length === 1 && outList.parts[0]?.synthetic === true && outList.parts[0]?.metadata?.__auto_queue_internal === true
+      && !/Queued: 2/.test(outList.parts[0].text)
+      && toasts.some((t: any) => /Queued: 2/.test(t.body?.message ?? "")),
+    outList.parts[0].text.slice(0, 60));
   const outDrop: any = { parts: [{ type: "text", text: "placeholder" }] };
   await hooks["command.execute.before"]({ command: "queue", sessionID: "sC", arguments: "drop 1" }, outDrop);
-  check("/queue drop 1 intercepted (alias -> delete), removed task A",
-    outDrop.parts[0]?.metadata?.__auto_queue_internal === true && /Deleted: queued task A/.test(outDrop.parts[0].text), outDrop.parts[0].text);
+  check("/queue drop 1 intercepted (alias -> delete), removed task A (toast, not model content)",
+    outDrop.parts.length === 1 && outDrop.parts[0]?.synthetic === true && !/Deleted: queued task A/.test(outDrop.parts[0].text)
+      && toasts.some((t: any) => (t.body?.message ?? "").includes("Deleted: queued task A")),
+    outDrop.parts[0].text.slice(0, 60));
   const outBogus: any = { parts: [{ type: "text", text: "untouched" }] };
   await hooks["command.execute.before"]({ command: "queue", sessionID: "sC", arguments: "frobnicate" }, outBogus);
   check("/queue <unknown> falls through to agent (parts untouched)", outBogus.parts[0].text === "untouched");
@@ -272,7 +277,11 @@ check("tool count shows 1 pending", /^1 messages/.test(cnt), cnt);
 // 4) Instant /queue-clear interception while busy (chat.message hook)
 const out4 = mkOut("/queue-status");
 await hooks["chat.message"]({ sessionID: "s1" }, out4);
-check("/queue-status intercepted instantly, not queued", out4.parts.length === 1 && out4.parts[0].metadata?.__auto_queue_internal === true && /Queued: 1/.test(out4.parts[0].text), out4.parts[0].text.split("\n")[0]);
+check("/queue-status intercepted instantly, not queued (hidden ack, result toast)",
+  out4.parts.length === 1 && out4.parts[0].metadata?.__auto_queue_internal === true && out4.parts[0].synthetic === true
+    && !/Queued: 1/.test(out4.parts[0].text)
+    && toasts.some((t: any) => /Queued: 1/.test(t.body?.message ?? "")),
+  out4.parts[0].text.slice(0, 60));
 
 // 5) Idle drain with transient failure -> retry succeeds (exercises backoffDelay fix)
 failFirstPrompt = true;

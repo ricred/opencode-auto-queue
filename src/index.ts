@@ -17,6 +17,8 @@ interface AutoQueueOptions {
   drainDelayMs?: number;
   autoRetryOnIdle?: boolean;
   persistQueue?: boolean;
+  failedToastDurationMs?: number;
+  queueToastHeartbeatMs?: number;
   persistPath?: string;
   persistDebounceMs?: number;
   watchDebounceMs?: number;
@@ -184,6 +186,31 @@ function makePlaceholder(parts: any[], count: number, template: string): any {
 
 function isInternalMessage(parts: any[]): boolean {
   return parts.some((p: any) => p.type === "text" && Boolean(p.metadata?.[INTERNAL_KEY]));
+}
+
+// Replacement content for an intercepted /queue command message.
+//
+// Upstream facts (v1.18.34, commit aec0b9a6):
+// - Server: command() -> command.execute.before -> prompt() -> loop() always
+//   runs the agent turn; no plugin hook can cancel it (noReply is not settable
+//   for commands).
+// - TUI (routes/session/index.tsx): user messages whose text parts are ALL
+//   synthetic/ignored are NOT rendered in the transcript.
+// - Model prompt (session/message-v2.ts): only `ignored`/empty text parts are
+//   excluded from the LLM call; `synthetic` text parts ARE sent.
+//
+// Therefore the ack part is synthetic (invisible in TUI — the command "does
+// not appear in the session") but NOT ignored (the model gets a harmless
+// inert instruction instead of an empty user message, which would be dropped
+// from the prompt and could trigger a provider error or a stale-context
+// continuation). The action itself is executed plugin-side and its result is
+// surfaced as a toast; the model never sees command text or results, so it
+// cannot re-execute the action.
+const COMMAND_ACK_TEXT =
+  "<system-reminder>message-queue plugin: the user's /queue command was handled internally by the plugin and is already complete. The result was shown to the user as a toast. Do not call any queue tool. Do not take any action. Do not repeat or summarize the command. Reply with nothing or a single short acknowledgment.</system-reminder>";
+
+function makeCommandAckPart(): any {
+  return { type: "text", text: COMMAND_ACK_TEXT, synthetic: true, metadata: { [INTERNAL_KEY]: true } };
 }
 
 function markInternalParts(parts: any[]): any[] {
@@ -469,6 +496,20 @@ export const AutoQueuePlugin = {
       try {
         await client.tui.showToast({
           body: { title: "Message Queue", message, variant, duration },
+        });
+      } catch {
+        // TUI may not be active
+      }
+    }
+
+    // Command results are surfaced ONLY as a toast: the intercepted command
+    // message is hidden from the transcript (synthetic part), so the toast is
+    // the user's feedback channel for the action's output.
+    async function showResultToast(result: string) {
+      const message = result.length > 400 ? `${result.slice(0, 397)}...` : result;
+      try {
+        await client.tui.showToast({
+          body: { title: "Message Queue", message, variant: "info", duration: toastDurationMs },
         });
       } catch {
         // TUI may not be active
@@ -1009,7 +1050,9 @@ export const AutoQueuePlugin = {
           const cleared = queue.length;
           queueBySession.set(sessionID, []);
           schedulePersist();
-          showToast(sessionID, true).catch(() => {});
+          // No toast here: the command result toast reports the clear. The old
+          // forced "Queue empty. All queued messages sent." here was a false
+          // success signal — cleared items were discarded, not sent.
           return `Cleared ${cleared} messages from queue`;
         }
         case "pause": {
@@ -1157,7 +1200,12 @@ export const AutoQueuePlugin = {
       ) => {
         const result = handleSlashCommand(input.command, input.arguments ?? "", input.sessionID);
         if (result === null) return;
-        output.parts = markInternalParts([{ type: "text", text: result }]);
+        // Execute plugin-side, surface the result as a toast, and leave only
+        // the hidden ack part in the message (see makeCommandAckPart). The
+        // command text/result must never reach the model — otherwise the model
+        // re-executes the action via the queue tool (double execution).
+        void showResultToast(result);
+        output.parts = [makeCommandAckPart()];
       },
 
   event: async ({ event }: { event: any }) => {
@@ -1200,8 +1248,11 @@ export const AutoQueuePlugin = {
         const cmdArgs = trimmed.replace(/^\//, "").slice(cmdName.length).trim();
         const result = handleSlashCommand(cmdName, cmdArgs, input.sessionID);
         if (result !== null) {
+          // Same contract as command.execute.before: result goes to a toast
+          // only; the stored message keeps just the hidden ack part.
+          void showResultToast(result);
           output.parts.length = 0;
-          output.parts.push(...markInternalParts([{ type: "text", text: result }]));
+          output.parts.push(makeCommandAckPart());
           return;
         }
       }
@@ -1215,8 +1266,9 @@ export const AutoQueuePlugin = {
         const rawArgs = templateMatch[1].replace(/\.\s*$/, "").trim();
         const result = handleSlashCommand("queue", rawArgs, input.sessionID);
         if (result !== null) {
+          void showResultToast(result);
           output.parts.length = 0;
-          output.parts.push(...markInternalParts([{ type: "text", text: result }]));
+          output.parts.push(makeCommandAckPart());
           return;
         }
       }

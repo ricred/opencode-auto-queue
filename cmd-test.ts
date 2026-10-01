@@ -51,9 +51,31 @@ const expandedStatus = {
 await h["chat.message"]({ sessionID: "s1", agent: "build", messageID: "m2" }, { ...expandedStatus, ...mockOut() },
 );
 const statusParts = expandedStatus.parts as any[];
-const selfEnqueued = statusParts.some((p) => p.type === "text" && p.text.includes("Use the queue tool"));
+const ackOk = (parts: any[]) =>
+  parts.length === 1 && parts[0].type === "text" && parts[0].synthetic === true && parts[0].text.includes("/queue command was handled internally");
+const selfEnqueued = statusParts.some((p: any) => p.type === "text" && p.text.includes("Use the queue tool"));
 check("expanded /queue status intercepted, not enqueued", !selfEnqueued, JSON.stringify(statusParts).slice(0, 120));
-check("status result injected as internal part", statusParts.some((p) => p.type === "text" && p.text.includes("Queued:")), JSON.stringify(statusParts).slice(0, 120));
+check("status replaced by hidden ack part (synthetic, no result text)", ackOk(statusParts), JSON.stringify(statusParts).slice(0, 200));
+const statusResultToasted = toasts.some((t) => typeof t.message === "string" && t.message.includes("Queued:"));
+check("status result surfaced as toast, not model content", statusResultToasted, JSON.stringify(toasts.map((t) => t.message)).slice(0, 200));
+
+// ── raw "/queue clear" must execute + hide from session, model never acts ──
+// enqueue a second item so clear has something to remove
+await h["chat.message"](
+  { sessionID: "s1", agent: "build", messageID: "m1b", model: { providerID: "p", modelID: "m" } },
+  { parts: [{ type: "text", text: "queued task B" }], ...mockOut() },
+);
+const clearCmd = { parts: [{ type: "text", text: "/queue clear" }] };
+await h["chat.message"]({ sessionID: "s1", agent: "build", messageID: "m3" }, { ...clearCmd, ...mockOut() });
+const clearParts = clearCmd.parts as any[];
+check("/queue clear replaced by hidden ack part", ackOk(clearParts), JSON.stringify(clearParts).slice(0, 200));
+check("/queue clear result shown as toast", toasts.some((t) => typeof t.message === "string" && t.message.includes("Cleared 2")), JSON.stringify(toasts.map((t) => t.message)).slice(0, 200));
+const cmdOut = { parts: [{ type: "text", text: "template never used" }] };
+await h["command.execute.before"](
+  { command: "queue", sessionID: "s1", arguments: "clear" },
+  cmdOut as any,
+);
+check("command.execute.before replaces template parts with ack", ackOk(cmdOut.parts as any[]), JSON.stringify(cmdOut.parts).slice(0, 200));
 
 // ── Bug 2: no forced-empty toast from reload ──
 // (reloadFromDisk fires via watcher; force it deterministically)
@@ -64,11 +86,11 @@ function fsSleep() { return new Promise((r) => setTimeout(r, 400)); }
 const emptyLie = toasts.filter((t) => t.message?.includes("All queued messages sent")).length;
 check("no phantom 'queue empty' toast from watcher reload", emptyLie === 0, `toasts=${JSON.stringify(toasts)}`);
 
-// ── sanity: real drain still fires success toast when queue empties ──
-// free the session (idle event) and let drain send the queued item
+// ── sanity: cleared queue delivers nothing on idle ──
+// free the session (idle event); drain must find nothing (clear removed both items)
 await h.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } });
 await new Promise((r) => setTimeout(r, 500));
-check("real drain delivered queued item", prompts.length === 1, `prompts=${prompts.length}`);
+check("clear removed queued items (no delivery on idle)", prompts.length === 0, `prompts=${prompts.length}`);
 
 rmSync(repo, { recursive: true, force: true });
 
